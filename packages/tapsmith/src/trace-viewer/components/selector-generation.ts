@@ -1,7 +1,8 @@
 import type { HierarchyNode } from './hierarchy-utils.js';
-import { getNodeRole, WEBVIEW_TAG_TO_ROLE, ANDROID_CLASS_TO_ROLE, IOS_TYPE_TO_ROLE } from './hierarchy-utils.js';
+import { getNodeRole, isLabelField, webViewAriaLabel, WEBVIEW_TAG_TO_ROLE, ANDROID_CLASS_TO_ROLE, IOS_TYPE_TO_ROLE } from './hierarchy-utils.js';
 import { unknownRoleMessage } from '../../roles.js';
 import { escapeJsString, hasPrivateUseChar } from '../../js-string-escape.js';
+import { cssIdSelector, isCssIdentifier } from '../../css-selector.js';
 
 // ─── Attribute Helpers ───
 
@@ -62,10 +63,6 @@ function getWebViewRole(node: HierarchyNode): string | null {
 }
 
 // ─── Selector Generation ───
-
-export const FORM_FIELD_ROLES = new Set([
-  'textfield', 'checkbox', 'switch', 'searchfield', 'seekbar', 'radiobutton', 'spinner',
-]);
 
 // Roles that are always generic containers — demote regardless of source.
 const ALWAYS_GENERIC_ROLES = new Set(['other', 'none']);
@@ -166,10 +163,12 @@ function generateWebViewSelectors(node: HierarchyNode): GeneratedSelector[] {
     });
   }
 
-  // 3. Label (aria-label) — Testing Library getByLabelText
-  if (ariaLabel) {
+  // 3. Label (aria-label) — Testing Library getByLabelText. webview.getByLabel
+  // matches the aria-label attribute only, not a <label> or aria-labelledby.
+  const ariaLabelAttr = webViewAriaLabel(node);
+  if (ariaLabelAttr) {
     selectors.push({
-      code: `webview.getByLabel("${escapeJsString(ariaLabel)}")`,
+      code: `webview.getByLabel("${escapeJsString(ariaLabelAttr)}")`,
       label: 'Label',
       priority: 3,
     });
@@ -205,7 +204,7 @@ function generateWebViewSelectors(node: HierarchyNode): GeneratedSelector[] {
   // 7. CSS id selector
   if (id) {
     selectors.push({
-      code: `webview.locator("#${escapeJsString(id)}")`,
+      code: `webview.locator("${escapeJsString(cssIdSelector(id))}")`,
       label: 'CSS #id',
       priority: 7,
     });
@@ -214,7 +213,7 @@ function generateWebViewSelectors(node: HierarchyNode): GeneratedSelector[] {
   // 8. CSS tag selector (fallback)
   if (tag) {
     const cssClass = (node.attributes.get('webview-class') ?? '').split(/\s+/).filter(Boolean)[0];
-    if (cssClass) {
+    if (cssClass && isCssIdentifier(cssClass)) {
       selectors.push({
         code: `webview.locator("${tag}.${escapeJsString(cssClass)}")`,
         label: 'CSS tag.class',
@@ -259,8 +258,8 @@ function generateNativeSelectors(node: HierarchyNode): GeneratedSelector[] {
   const accessibleName = roleNameFor(fullName) || fullName;
   // getByLabel matches Android's content-desc (or a labelling view, which
   // the dump does not carry) — never the field's own text, which is its
-  // typed value or hint — and iOS's label.
-  const labelName = ios ? label : contentDesc;
+  // typed value or hint — and iOS's label or title.
+  const labelName = ios ? (label || (node.attributes.get('title') ?? '')) : contentDesc;
 
   // Demote role-based selectors when the role is generic OR when it came from
   // the agent's accessibility-trait heuristic (tapsmith-role) on a node whose
@@ -292,10 +291,10 @@ function generateNativeSelectors(node: HierarchyNode): GeneratedSelector[] {
     });
   }
 
-  // 3. Label — Testing Library getByLabelText (form fields only)
-  // Android: getByLabel matches inputs by contentDescription
-  // iOS: getByLabel matches inputs by accessibilityLabel
-  if (role && FORM_FIELD_ROLES.has(role) && labelName) {
+  // 3. Label — Testing Library getByLabelText, for the inputs the runtime's
+  // getByLabel finds (PILOT-666): Android by contentDescription, iOS by
+  // accessibilityLabel.
+  if (isLabelField(node) && labelName) {
     selectors.push({
       code: `device.getByLabel("${escapeJsString(labelName)}")`,
       label: 'Label',

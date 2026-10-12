@@ -1,4 +1,5 @@
 import { decodeXmlEntities } from '../../xml-entities.js';
+import { ANDROID_ROLE_CLASSES } from '../../roles.js';
 
 // ─── Types ───
 
@@ -119,11 +120,12 @@ export const ANDROID_CLASS_TO_ROLE: Record<string, string> = {
   'com.google.android.material.slider.Slider': 'seekbar',
 };
 
+// No XCUIElementTypeTextView: the iOS agent's getByRole("textfield") does not
+// find a multi-line text view, so the playground must not offer it (PILOT-666).
 export const IOS_TYPE_TO_ROLE: Record<string, string> = {
   'XCUIElementTypeButton': 'button',
   'XCUIElementTypeTextField': 'textfield',
   'XCUIElementTypeSecureTextField': 'textfield',
-  'XCUIElementTypeTextView': 'textfield',
   'XCUIElementTypeSwitch': 'switch',
   'XCUIElementTypeCheckBox': 'checkbox',
   'XCUIElementTypeImage': 'image',
@@ -168,3 +170,52 @@ export function getNodeRole(node: HierarchyNode): string {
   return IOS_TYPE_TO_ROLE[iosType] ?? '';
 }
 
+// ─── getByLabel Fields ───
+
+/**
+ * The element types the iOS agent's getByLabel finds (its
+ * `LabelMatch.inputTypes`, ios-agent LabelMatchTests): by element type, not by
+ * reported role — a text field keeps its type whatever trait role it reports,
+ * and a search field is not one of them (PILOT-666).
+ */
+export const IOS_LABEL_FIELD_TYPES: ReadonlySet<string> = new Set([
+  'XCUIElementTypeTextField',
+  'XCUIElementTypeSecureTextField',
+  'XCUIElementTypeTextView',
+  'XCUIElementTypeSwitch',
+  'XCUIElementTypeSlider',
+  'XCUIElementTypeStepper',
+  'XCUIElementTypePicker',
+  'XCUIElementTypeCheckBox',
+  'XCUIElementTypeRadioButton',
+]);
+
+/**
+ * The classes the Android agent's getByLabel walks (its `labelInputClassPattern`):
+ * the classes of these roles in its role map, which roles.test.ts pins to
+ * ANDROID_ROLE_CLASSES (the roles themselves are pinned by
+ * label-conformance.test.ts). A view that only reports one of the roles (an RN
+ * `accessibilityRole="checkbox"` ViewGroup) is not walked.
+ */
+export const ANDROID_LABEL_FIELD_ROLES: readonly string[] = ['textfield', 'checkbox', 'switch', 'radiobutton', 'seekbar', 'spinner'];
+const ANDROID_LABEL_FIELD_CLASSES: ReadonlySet<string> = new Set(
+  ANDROID_LABEL_FIELD_ROLES.flatMap((role) => ANDROID_ROLE_CLASSES[role] ?? []),
+);
+
+/** Whether the runtime's getByLabel can find this node: a native input of a type or class the agent looks at. */
+export function isLabelField(node: HierarchyNode): boolean {
+  if (node.attributes.get('webview') === 'true') return false;
+  const className = node.attributes.get('class');
+  if (className !== undefined) return ANDROID_LABEL_FIELD_CLASSES.has(className);
+  return IOS_LABEL_FIELD_TYPES.has(node.attributes.get('type') ?? node.tagName);
+}
+
+/**
+ * The `aria-label` attribute of a WebView node — what `webview.getByLabel`
+ * matches. The node's content-desc is its computed accessible name (also
+ * from aria-labelledby or a `<label>`), which getByLabel does not read
+ * (PILOT-666). A dump that predates the attribute falls back to content-desc.
+ */
+export function webViewAriaLabel(node: HierarchyNode): string {
+  return node.attributes.get('webview-aria-label') ?? node.attributes.get('content-desc') ?? '';
+}

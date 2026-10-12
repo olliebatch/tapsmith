@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import type { HierarchyNode } from '../trace-viewer/components/hierarchy-utils.js';
-import { getNodeRole } from '../trace-viewer/components/hierarchy-utils.js';
-import { generateSelectors, generateBestSelector, findBetterDescendant, hasGoodSelectors, FORM_FIELD_ROLES } from '../trace-viewer/components/selector-generation.js';
+import { getNodeRole, isLabelField } from '../trace-viewer/components/hierarchy-utils.js';
+import { generateSelectors, generateBestSelector, findBetterDescendant, hasGoodSelectors } from '../trace-viewer/components/selector-generation.js';
 import { parseSelectorString, findMatchingNodes, hitTest, applyPositionalIndex, parsedSelectorError } from '../trace-viewer/components/selector-matching.js';
 
 function makeNode(tagName: string, attrs: Record<string, string>, children: HierarchyNode[] = []): HierarchyNode {
@@ -202,6 +202,50 @@ describe('generateWebViewSelectors priority order', () => {
     ]);
   });
 
+  it('suggests an id that is not a CSS identifier as an attribute selector the playground resolves (PILOT-666)', () => {
+    for (const id of [':r1:', '1st', 'order.total']) {
+      const node = makeNode('node', { webview: 'true', 'webview-tag': 'div', 'webview-id': id });
+      const idSelector = generateSelectors(node).find((s) => s.label === 'CSS #id')!;
+      expect(idSelector.code).toBe(`webview.locator("[id=\\"${id}\\"]")`);
+      const root = makeNode('node', {}, [node]);
+      expect(findMatchingNodes([root], parseSelectorString(idSelector.code)!)).toEqual([node]);
+      // The #id form the runtime rejects or misreads matches nothing here either.
+      expect(findMatchingNodes([root], parseSelectorString(`webview.locator("#${id}")`)!)).toEqual([]);
+    }
+  });
+
+  it('the playground matches #id, .class and their tag forms only where the runtime does (PILOT-666)', () => {
+    const node = makeNode('node', { webview: 'true', 'webview-tag': 'div', 'webview-id': 'café', 'webview-class': 'md:flex card' });
+    const other = makeNode('node', { webview: 'true', 'webview-tag': 'div', 'webview-id': 'order.total' });
+    const root = makeNode('node', {}, [node, other]);
+    const count = (css: string) => findMatchingNodes([root], parseSelectorString(`webview.locator("${css}")`)!).length;
+    expect(count('#café')).toBe(1);
+    expect(count('div#café')).toBe(1);
+    expect(count('.card')).toBe(1);
+    expect(count('div.card')).toBe(1);
+    expect(count('.md:flex')).toBe(0);
+    expect(count('div.md:flex')).toBe(0);
+    expect(count('div#order.total')).toBe(0);
+  });
+
+  it('suggests tag.class only for a class that is a CSS identifier (PILOT-666)', () => {
+    const node = makeNode('node', { webview: 'true', 'webview-tag': 'div', 'webview-class': 'md:flex card' });
+    expect(generateSelectors(node).some((s) => s.label === 'CSS tag.class')).toBe(false);
+  });
+
+  it('suggests and matches webview.getByLabel by the aria-label attribute only, as the runtime does (PILOT-666)', () => {
+    // <label for="email">Email</label><input id="email">: an accessible name, no aria-label.
+    const labelled = makeNode('node', { webview: 'true', 'webview-tag': 'input', 'content-desc': 'Email', 'webview-aria-label': '' });
+    const ariaLabelled = makeNode('node', { webview: 'true', 'webview-tag': 'input', 'content-desc': 'Search', 'webview-aria-label': 'Search' });
+    expect(generateSelectors(labelled).some((s) => s.label === 'Label')).toBe(false);
+    expect(generateSelectors(ariaLabelled).some((s) => s.code === 'webview.getByLabel("Search")')).toBe(true);
+    const root = makeNode('node', {}, [labelled, ariaLabelled]);
+    expect(findMatchingNodes([root], parseSelectorString('webview.getByLabel("Email")')!)).toEqual([]);
+    expect(findMatchingNodes([root], parseSelectorString('webview.getByLabel("Search")')!)).toEqual([ariaLabelled]);
+    // The role name is still the accessible name.
+    expect(findMatchingNodes([root], parseSelectorString('webview.getByRole("textfield", { name: "Email" })')!)).toEqual([labelled]);
+  });
+
   it('Label comes before Text for webview elements', () => {
     const node = makeNode('node', {
       webview: 'true',
@@ -342,19 +386,48 @@ describe('findMatchingNodes with label selector', () => {
   });
 });
 
-// ─── FORM_FIELD_ROLES ───
+// ─── isLabelField (PILOT-666) ───
 
-describe('FORM_FIELD_ROLES', () => {
-  it('includes expected form field types', () => {
-    for (const role of ['textfield', 'checkbox', 'switch', 'searchfield', 'seekbar', 'radiobutton', 'spinner']) {
-      expect(FORM_FIELD_ROLES.has(role)).toBe(true);
-    }
+describe('isLabelField: the inputs the runtime getByLabel finds', () => {
+  it('goes by iOS element type, not the reported role', () => {
+    expect(isLabelField(makeNode('XCUIElementTypeTextField', { type: 'XCUIElementTypeTextField', 'tapsmith-role': 'combobox' }))).toBe(true);
+    expect(isLabelField(makeNode('XCUIElementTypeStepper', { type: 'XCUIElementTypeStepper' }))).toBe(true);
+    expect(isLabelField(makeNode('XCUIElementTypeSearchField', { type: 'XCUIElementTypeSearchField' }))).toBe(false);
+    expect(isLabelField(makeNode('XCUIElementTypeOther', { type: 'XCUIElementTypeOther', 'tapsmith-role': 'checkbox' }))).toBe(false);
   });
 
-  it('does not include non-form roles', () => {
-    for (const role of ['button', 'text', 'image', 'heading', 'link', 'alert']) {
-      expect(FORM_FIELD_ROLES.has(role)).toBe(false);
-    }
+  it('goes by Android class, not the reported role', () => {
+    expect(isLabelField(makeNode('node', { class: 'android.widget.EditText' }))).toBe(true);
+    expect(isLabelField(makeNode('node', { class: 'android.widget.SearchView' }))).toBe(false);
+    expect(isLabelField(makeNode('node', { class: 'android.view.ViewGroup', 'tapsmith-role': 'checkbox' }))).toBe(false);
+  });
+
+  it('is never a WebView node', () => {
+    expect(isLabelField(makeNode('node', { class: 'android.widget.EditText', webview: 'true' }))).toBe(false);
+  });
+});
+
+describe('getByLabel suggestions follow the runtime fields (PILOT-666)', () => {
+  const hasLabel = (node: HierarchyNode) => generateSelectors(node).some((s) => s.label === 'Label');
+
+  it('no getByLabel for an iOS search field, which getByLabel does not find', () => {
+    expect(hasLabel(makeNode('XCUIElementTypeSearchField', { type: 'XCUIElementTypeSearchField', label: 'Search' }))).toBe(false);
+  });
+
+  it('getByLabel for an iOS text field that reports a trait role', () => {
+    const node = makeNode('XCUIElementTypeTextField', { type: 'XCUIElementTypeTextField', label: 'Country', 'tapsmith-role': 'combobox' });
+    expect(generateSelectors(node).some((s) => s.code === 'device.getByLabel("Country")')).toBe(true);
+  });
+
+  it('a multi-line iOS text view is found by its label, not by a textfield role the runtime does not give it', () => {
+    const node = makeNode('XCUIElementTypeTextView', { type: 'XCUIElementTypeTextView', label: 'Notes' });
+    const selectors = generateSelectors(node);
+    expect(selectors[0].code).toBe('device.getByLabel("Notes")');
+    expect(selectors.some((s) => s.code.startsWith('device.getByRole("textfield"'))).toBe(false);
+  });
+
+  it('no getByLabel for an Android view that only reports a checkbox role', () => {
+    expect(hasLabel(makeNode('node', { class: 'android.view.ViewGroup', 'tapsmith-role': 'checkbox', 'content-desc': 'Agree' }))).toBe(false);
   });
 });
 

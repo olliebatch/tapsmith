@@ -8,6 +8,7 @@ import {
 } from './element-handle.js';
 import { WebViewLocator } from './webview-locator.js';
 import { escapeJsString } from './js-string-escape.js';
+import { cssIdSelector } from './css-selector.js';
 import type { TraceCollector } from './trace/trace-collector.js';
 import { extractStack } from './trace/trace-collector.js';
 import type { WebKitInspectorClient } from './webkit-inspector.js';
@@ -46,6 +47,8 @@ interface WebViewDomDescription {
   ariaLabel: string
   role: string
   text: string
+  /** No child elements: the only kind of element webview.getByText finds. */
+  leaf: boolean
 }
 
 /** @internal — Single-tick snapshot of a locator's full match set. */
@@ -71,9 +74,11 @@ function suggestWebViewSelectorFor(d: WebViewDomDescription | undefined): string
   // Copy-paste-safe string literals, like the native suggestions (PILOT-659).
   const lit = (v: string): string => `"${escapeJsString(v)}"`;
   if (d.testId) return `webview.getByTestId(${lit(d.testId)})`;
-  if (d.id) return `webview.locator(${lit('#' + d.id)})`;
+  if (d.id) return `webview.locator(${lit(cssIdSelector(d.id))})`;
   if (d.ariaLabel) return `webview.getByLabel(${lit(d.ariaLabel)})`;
-  if (d.text) {
+  // getByText finds leaf elements only: a parent's text would resolve to the
+  // child holding it, or to nothing when it spans several (PILOT-666).
+  if (d.text && d.leaf) {
     // An exact match needs the whole text: a long one is suggested as its
     // leading part, matched as a substring.
     const exact = d.text.length <= 60;
@@ -593,6 +598,7 @@ export class WebViewHandle {
           ariaLabel: el.getAttribute('aria-label') || '',
           role: el.getAttribute('role') || '',
           text: (el.textContent || '').trim().slice(0, 80),
+          leaf: el.children.length === 0,
         })),
         target: ${targetJs},
       };
@@ -826,6 +832,8 @@ export class WebViewHandle {
               if (el.closest && el.closest('label')) { var wrapper = el.closest('label'); var clone = wrapper.cloneNode(true); clone.querySelectorAll('input,select,textarea').forEach(function(c){c.remove();}); var t = clone.textContent?.trim(); if (t) return t; }
               return '';
             })(),
+            // The attribute alone: what webview.getByLabel matches (PILOT-666).
+            ariaLabelAttr: el.getAttribute('aria-label') || '',
             testId: el.getAttribute('data-testid') || '',
             type: el.getAttribute('type') || '',
             href: tag === 'a' ? (el.getAttribute('href') || '') : '',
@@ -863,6 +871,9 @@ export class WebViewHandle {
         if (node.placeholder) attrs.push(`hint="${escapeXmlAttr(node.placeholder)}"`);
         if (node.role) attrs.push(`webview-role="${escapeXmlAttr(node.role)}"`);
         if (node.ariaLabel) attrs.push(`content-desc="${escapeXmlAttr(node.ariaLabel)}"`);
+        // Always written, so a reader can tell "no aria-label" from a dump
+        // that predates the attribute.
+        attrs.push(`webview-aria-label="${escapeXmlAttr(node.ariaLabelAttr ?? '')}"`);
         if (node.testId) attrs.push(`webview-testid="${escapeXmlAttr(node.testId)}"`);
         if (node.type) attrs.push(`webview-type="${escapeXmlAttr(node.type)}"`);
         if (node.href) attrs.push(`webview-href="${escapeXmlAttr(node.href)}"`);
@@ -1132,6 +1143,7 @@ interface DomNode {
   placeholder: string
   role: string
   ariaLabel: string
+  ariaLabelAttr?: string
   testId: string
   type: string
   href: string
