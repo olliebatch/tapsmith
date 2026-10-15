@@ -16,7 +16,7 @@ import * as path from 'node:path';
 import { findDaemonBin } from './daemon-bin.js';
 import { findAgentApk, findAgentTestApk, missingAndroidAgentAdvice, type AndroidAgentAdvice } from './agent-resolve.js';
 import { formatJson, jsonError, stripAnsi, type JsonCheck } from './cli-json.js';
-import { avdCaptureSupport, captureAvdFix, scanAvdImageTags, type AvdImageInfo } from './avd-images.js';
+import { PLAY_IMAGE_CAPTURE_EFFECT, avdCaptureSupport, captureAvdFix, scanAvdImageTags, type AvdImageInfo } from './avd-images.js';
 import { parseSimctlDevicesJson, tryExec } from './env-scan.js';
 import { androidUnusableDeviceFix, parseAdbDevicesOutput, type AdbDevice } from './adb-devices.js';
 import { isTapsmithNotInstalledError, type TapsmithConfig } from './config.js';
@@ -426,7 +426,7 @@ export function summarizeAvdImages(avds: AvdImageInfo[], configuredAvd?: string 
     const configuredUnreadable = configured.filter((a) => avdCaptureSupport(a) === 'unknown');
     const issues: string[] = [
       ...missing.map((name) => `Configured AVD ${name} not found on this machine`),
-      ...configuredPlay.map((a) => `Configured AVD ${a.name} uses a Google Play system image — no adb root, so HTTPS traffic will not be captured`),
+      ...configuredPlay.map((a) => `Configured AVD ${a.name} uses a Google Play system image — ${PLAY_IMAGE_CAPTURE_EFFECT}`),
       ...configuredUnreadable.map((a) => `Could not read the system image tag of configured AVD ${a.name}`),
     ];
     if (issues.length > 0) {
@@ -463,7 +463,7 @@ export function summarizeAvdImages(avds: AvdImageInfo[], configuredAvd?: string 
     const context = capable > 0 ? `; ${capable} other AVD${capable === 1 ? ' is' : 's are'} capture-capable` : '';
     return {
       status: 'warn',
-      label: `${playStore.length} of ${avds.length} AVD${avds.length === 1 ? '' : 's'} use${playStore.length === 1 ? 's' : ''} a Google Play system image — no adb root, so HTTPS traffic will not be captured`,
+      label: `${playStore.length} of ${avds.length} AVD${avds.length === 1 ? '' : 's'} use${playStore.length === 1 ? 's' : ''} a Google Play system image — ${PLAY_IMAGE_CAPTURE_EFFECT}`,
       detail: `${playStore.map((a) => a.name).join(', ')}${context}`,
       fix: captureAvdFix(avds, { apiLevel: playStore[0].apiLevel }),
     };
