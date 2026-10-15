@@ -112,9 +112,11 @@ describe("Login screen", () => {
 
 ## Test isolation
 
-Tests must not depend on each other. Each test should start from a known state and leave the device in a state that does not affect subsequent tests.
+Tapsmith resets the app for you, but by default only **once per test file**, not before every test. The tests in a file share the app: the second test starts on whatever screen the first one left, with any state it created, such as a signed-in user. This differs from Playwright, where every test gets a fresh browser context. A file whose tests each need a fresh app opts in with `test.use({ appResetScope: "test" })` ([Declaring the reset policy](#declaring-the-reset-policy) below).
 
-Tapsmith resets the app for you — the mobile equivalent of Playwright giving every test a fresh browser context. The reset is **declared**, not written by hand: it runs as fixture setup, appears in the trace in its own **APP RESET** section just before **BEFORE ALL** (per-file) or **BEFORE EACH** (per-test) — so the hook sections contain only your code — and its time counts toward the test's duration so slow isolation is visible rather than hidden.
+So with the default, each test should bring the app to the state it needs itself (a deep link, say), rather than assume a fresh app or rely on where the previous test left off. A test that assumes a fresh app passes on its own and fails after another test, and one failure then cascades through the rest of the file. A test that relies on the previous one fails whenever it runs without it: a `--grep` or a single test run from UI mode starts it from a reset app. With the default policy, each file does start from a reset app, as long as the config sets `package` (as `tapsmith init` does).
+
+The reset is **declared**, not written by hand: it runs as fixture setup, appears in the trace in its own **APP RESET** section just before **BEFORE ALL** (per-file) or **BEFORE EACH** (per-test) — so the hook sections contain only your code — and its time counts toward the test's duration so slow isolation is visible rather than hidden.
 
 ### Declaring the reset policy
 
@@ -605,18 +607,19 @@ Each hook gets a time budget equal to the test timeout. A hook that never finish
 
 ### `beforeEach` / `afterEach`
 
-Run before and after every test in the enclosing `describe`. Use these for per-test setup like resetting app state:
+Run before and after every test in the enclosing `describe`. Use these to bring each test to its starting screen, or to undo what a test changed outside the app. Resetting the app itself is the `appResetScope` option's job ([Test isolation](#test-isolation)), not a hook's:
 
 ```typescript
 describe("Checkout", () => {
+  test.use({ appResetScope: "test" })  // a fresh app before every test
+
   beforeEach(async ({ device }) => {
-    await device.restartApp()
     await device.getByDescription("Cart").tap()
   })
 
   afterEach(async ({ device }) => {
-    // Clean up test data if needed
-    await device.clearAppData("com.example.myapp")
+    // Device settings outlive an app reset: put back what a test changed
+    await device.setOrientation("portrait")
   })
 
   test("shows empty cart message", async ({ device }) => {
@@ -652,11 +655,11 @@ All hooks receive the same `{ device }` fixture that tests do. `beforeAll` and `
 
 ```typescript
 beforeAll(async ({ device }) => {
-  await device.getByDescription("Login Form").tap()
+  await device.setOrientation("portrait")  // device-level, so it lasts
 })
 
 beforeEach(async ({ device }) => {
-  await device.restartApp()
+  await device.openDeepLink("myapp://login")  // each test's starting screen
 })
 ```
 
@@ -675,7 +678,7 @@ Hooks cascade through nested `describe` blocks. Inner hooks run after outer hook
 ```typescript
 describe("App", () => {
   beforeEach(async ({ device }) => {
-    await device.restartApp()             // runs first
+    await device.getByDescription("Home").tap()  // runs first
   })
 
   describe("Login", () => {
@@ -684,7 +687,7 @@ describe("App", () => {
     })
 
     test("shows sign in form", async ({ device }) => {
-      // restartApp() has run, then navigated to login
+      // Home was tapped first, then Login Form
       await expect(device.getByText("Sign In")).toBeVisible()
     })
   })
@@ -697,7 +700,7 @@ describe("App", () => {
 |---|---|---|
 | `beforeAll` | Once per `describe` | Navigating to a screen, one-time setup |
 | `afterAll` | Once per `describe` | Cleaning up shared resources |
-| `beforeEach` | Before every test | Resetting app state, ensuring a clean starting point |
+| `beforeEach` | Before every test | Navigating to the test's starting screen (reset the app with `appResetScope: "test"` instead) |
 | `afterEach` | After every test | Cleaning up test-specific side effects |
 
 **Caution:** `beforeAll` runs once, so all tests in that block share whatever state it creates. If one test modifies the screen, subsequent tests see that modification. When in doubt, use `beforeEach`.
