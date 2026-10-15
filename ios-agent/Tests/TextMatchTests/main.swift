@@ -63,6 +63,35 @@ expect("metacharacters are literal (contains)", matches(TextMatch.containsPatter
 expect("metacharacters are literal (quantifier)", !matches(TextMatch.containsPattern("a+"), "aaa"))
 expect("backslash sequences are literal", matches(TextMatch.exactPattern("\\Q\\E"), "\\Q\\E"))
 
+// Substring getByText ignores case, as Playwright's non-exact getByText does
+// (PILOT-522); exact matching stays case-sensitive.
+expect("contains ignores case (textTransform uppercase)", TextMatch.contains("GET STARTED", "get started"))
+expect("contains ignores case, mixed and normalized", TextMatch.contains("Welcome to\u{00A0}Expo", "wElCoMe  TO"))
+expect("contains ignores case, non-ASCII", TextMatch.contains("ÉCOLE NORMALE", "école"))
+expect("contains ignoring case still needs a substring", !TextMatch.contains("GET STARTED", "get startedx"))
+expect("contains pattern ignores case", matches(TextMatch.containsPattern("get started"), "GET STARTED"))
+expect("contains pattern ignores case across NBSP", matches(TextMatch.containsPattern("TO expo"), "Welcome to\u{00A0}Expo"))
+expect("contains pattern metacharacters stay literal", matches(TextMatch.containsPattern("[BETA]*"), "try [beta]* now"))
+expect("exact pattern stays case-sensitive", !matches(TextMatch.exactPattern("get started"), "GET STARTED"))
+
+// The snapshot walk (TextMatch.contains) and the live XCUIElement query
+// (containsPattern) must agree, or the live query's index binds another
+// element: including the case-folding corners ICU folds fully.
+let foldCorpus: [(String, String)] = [
+    ("STRASSE", "straße"), ("straße", "STRASSE"), ("İSTANBUL", "istanbul"), ("istanbul", "İSTANBUL"),
+    ("\u{212A}elvin", "kelvin"), ("ſtop", "STOP"), ("STOP", "ſtop"), ("ΣΟΦΙΑΣ", "σοφιας"),
+    ("σοφιας", "ΣΟΦΙΑΣ"), ("ﬁle", "FILE"), ("FILE", "ﬁle"), ("ÉCOLE", "école"), ("Save draft", "SAVE  DRAFT"),
+    ("Sign out", "sign in"),
+    // NSPredicate's MATCHES also ignores character width under (?i), which
+    // Foundation's case-insensitive search does not; Greek dialytika go the
+    // other way.
+    ("ＯＫ", "ok"), ("OK", "ｏｋ"), ("\u{0390}", "\u{03AA}\u{0301}"),
+]
+for (text, query) in foldCorpus {
+    expect("snapshot and live query agree: \(text) / \(query)",
+           TextMatch.contains(text, query) == matches(TextMatch.containsPattern(query), text))
+}
+
 // The concatenated-label pattern accepts at least what containsChildText does.
 let concat = TextMatch.concatenatedLabelPattern("Welcome to Expo")
 expect("concatenated pattern: whole label", matches(concat, "Welcome to\u{00A0}Expo"))
@@ -106,6 +135,27 @@ expect("same id, different label: own label only", QueryIndex.liveIndex(of: 1, i
 let saves = [node(staticText, "Save"), node(other, "Save"), node(button, "Save"), node(other, "Save")]
 expect(".any scope counts every same-label node", QueryIndex.liveIndex(of: 3, in: saves, scopeTypeRaw: nil) == 3)
 expect("a specific scope counts only its type", QueryIndex.liveIndex(of: 2, in: saves, scopeTypeRaw: button) == 0)
+
+// A substring getByText match found only through its value (an RN field's
+// placeholder, empty label) is re-resolved by the selector's own query, so
+// its index counts every earlier node of the scoped type that query returns
+// (PILOT-522) — not its position among matches of every type.
+let textField: UInt = 49
+let emailScreen = [
+    QueryNode(typeRaw: staticText, label: "EMAIL", identifier: ""),
+    QueryNode(typeRaw: textField, label: "", identifier: "", title: "", value: "Email"),
+    QueryNode(typeRaw: textField, label: "", identifier: "", title: "", value: "Confirm email"),
+]
+let emailMatched = QueryIndex.substringMatches(in: emailScreen, query: "email")
+expect("substring fallback: the query returns all three nodes", emailMatched == [true, true, true])
+expect("substring fallback: first field is index 0 in the field query",
+       QueryIndex.substringLiveIndex(of: 1, in: emailScreen, scopeTypeRaw: textField, matched: emailMatched) == 0)
+expect("substring fallback: second field counts the first",
+       QueryIndex.substringLiveIndex(of: 2, in: emailScreen, scopeTypeRaw: textField, matched: emailMatched) == 1)
+expect("substring fallback: .any scope counts the header too",
+       QueryIndex.substringLiveIndex(of: 1, in: emailScreen, scopeTypeRaw: nil, matched: emailMatched) == 1)
+expect("contains: empty text holds only an empty query",
+       !TextMatch.contains("", "email") && TextMatch.contains("", " "))
 
 // RegExp locators (PILOT-520): the SDK's conformance fixture, replayed
 // through ICU (NSRegularExpression for the snapshot walk, NSPredicate MATCHES

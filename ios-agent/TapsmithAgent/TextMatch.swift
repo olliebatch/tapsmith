@@ -5,15 +5,17 @@ import Foundation
 /// collapse to one space and the ends are trimmed, on both the element's
 /// label and the query, exact or substring. A label rendered with a
 /// non-breaking space (`Welcome to&nbsp;Expo`) or a line break then matches a
-/// query typed with plain spaces.
+/// query typed with plain spaces. As in Playwright, a substring match ignores
+/// case and an exact one doesn't.
 ///
 /// "Whitespace" is JavaScript's `\s` set, the same set the Android agent's
 /// TextMatch.kt and the SDK's trace-viewer matcher use.
 ///
-/// The snapshot walk compares normalized strings. XCUIElement queries can't
-/// normalize, so they get an ICU pattern (`label MATCHES %@`, a full match)
-/// that accepts the same labels: the query's words, escaped, joined by
-/// one-or-more whitespace.
+/// The snapshot walk compares normalized strings, except a substring match,
+/// which evaluates the same ICU pattern the live queries use (see `contains`).
+/// XCUIElement queries can't normalize, so they get an ICU pattern
+/// (`label MATCHES %@`, a full match) that accepts the same labels: the
+/// query's words, escaped, joined by one-or-more whitespace.
 enum TextMatch {
     /// JavaScript's `\s`: ECMAScript WhiteSpace and LineTerminator code points.
     private static let whitespace: Set<Unicode.Scalar> = {
@@ -52,10 +54,28 @@ enum TextMatch {
         normalize(text) == normalize(query)
     }
 
-    /// Whether the normalized `text` contains the normalized `query`.
+    /// Whether the normalized `text` contains the normalized `query`,
+    /// ignoring case — Playwright's non-exact getByText (PILOT-522).
+    /// Evaluated with the very predicate the live XCUIElement queries use
+    /// (`MATCHES containsPattern`), so the snapshot walk and a live query
+    /// agree on every label — NSPredicate's ICU folding has corners (full
+    /// folding, width under `(?i)`) no Swift string search reproduces — and
+    /// a live query's positional index binds the element the walk matched.
     static func contains(_ text: String, _ query: String) -> Bool {
-        let needle = normalize(query)
-        return needle.isEmpty || normalize(text).contains(needle)
+        // An empty text contains only an empty query (the pattern says the
+        // same), and is most titles and values: skip the predicate.
+        if text.isEmpty { return normalize(query).isEmpty }
+        return containsPredicate(query).evaluate(with: text)
+    }
+
+    /// One parsed predicate per query: the snapshot walk tests every node.
+    private static let containsPredicates = NSCache<NSString, NSPredicate>()
+
+    private static func containsPredicate(_ query: String) -> NSPredicate {
+        if let cached = containsPredicates.object(forKey: query as NSString) { return cached }
+        let predicate = NSPredicate(format: "SELF MATCHES %@", containsPattern(query))
+        containsPredicates.setObject(predicate, forKey: query as NSString)
+        return predicate
     }
 
     /// Whether `childText` is one of the child texts iOS joined with ", " to
@@ -88,9 +108,10 @@ enum TextMatch {
         "\(wsClass)*\(words(query))\(wsClass)*"
     }
 
-    /// ICU full-match pattern: the normalized label contains the normalized `query`.
+    /// ICU full-match pattern: the normalized label contains the normalized
+    /// `query`, ignoring case (PILOT-522), the same test as `contains`.
     static func containsPattern(_ query: String) -> String {
-        "(?s).*\(words(query)).*"
+        "(?is).*\(words(query)).*"
     }
 
     /// ICU full-match pattern for `containsChildText`: the whole label, or a
@@ -114,6 +135,8 @@ struct QueryNode {
     let typeRaw: UInt
     let label: String
     let identifier: String
+    var title: String = ""
+    var value: String = ""
 }
 
 /// Positional bookkeeping for re-resolving a role+name snapshot match through
@@ -133,6 +156,27 @@ enum QueryIndex {
         where node.label == target.label
             && (target.identifier.isEmpty || node.identifier == target.identifier)
             && (scopeTypeRaw == nil || node.typeRaw == scopeTypeRaw) {
+            count += 1
+        }
+        return count
+    }
+
+    /// Which `nodes` a live substring-text query
+    /// (`label/title/value MATCHES containsPattern(query)`, PILOT-522)
+    /// returns, ignoring its type scope. Computed once per find.
+    static func substringMatches(in nodes: [QueryNode], query: String) -> [Bool] {
+        nodes.map {
+            TextMatch.contains($0.label, query) || TextMatch.contains($0.title, query)
+                || TextMatch.contains($0.value, query)
+        }
+    }
+
+    /// The index of `nodes[ordinal]` within that query on the scoped type:
+    /// every earlier node of that type it returns (`matched`, from
+    /// `substringMatches`) — for a match with no label to re-resolve it by.
+    static func substringLiveIndex(of ordinal: Int, in nodes: [QueryNode], scopeTypeRaw: UInt?, matched: [Bool]) -> Int {
+        var count = 0
+        for i in 0..<ordinal where matched[i] && (scopeTypeRaw == nil || nodes[i].typeRaw == scopeTypeRaw) {
             count += 1
         }
         return count

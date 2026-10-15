@@ -141,9 +141,9 @@ class SnapshotElementFinder {
         let keyboardVisibleInSnapshot = hasKeyboardInTree(snapshotDict)
 
         // Number the app's descendants in pre-order (XCUIElementQuery order)
-        // so a role+name or RegExp match can be re-resolved by its index
-        // within the live query that finds it again (cacheQueryElement,
-        // PILOT-549, PILOT-520).
+        // so a role+name, RegExp or substring-text match can be re-resolved
+        // by its index within the live query that finds it again
+        // (cacheQueryElement, PILOT-549, PILOT-520, PILOT-522).
         var queryNodes: [QueryNode] = []
         if selector.reResolvesByLabel || selector.roleOnlyReResolvesByLabel {
             SnapshotElementFinder.numberDescendants(of: &snapshotDict, into: &queryNodes)
@@ -194,6 +194,17 @@ class SnapshotElementFinder {
             idSeen[id] = n + 1
             return n
         }
+        // A label-less substring-text match is re-resolved by the selector's
+        // own query: which numbered nodes that query returns, computed once
+        // and only when such a match exists.
+        var substringMatched: [Bool]?
+        if let textContains = selector.textContains, matches.contains(where: { (nodeDict, _) in
+            guard let ordinal = nodeDict[SnapshotElementFinder.ordinalKey] as? Int,
+                  ordinal < queryNodes.count else { return false }
+            return queryNodes[ordinal].label.isEmpty
+        }) {
+            substringMatched = QueryIndex.substringMatches(in: queryNodes, query: textContains)
+        }
         // Each role+name match's index within the live query that
         // cacheQueryElement re-resolves it with (nil: no numbered node).
         let labelIndices: [Int?] = matches.map { (nodeDict, _) in
@@ -202,6 +213,13 @@ class SnapshotElementFinder {
             let raw = queryNodes[ordinal].typeRaw
             let type = XCUIElement.ElementType(rawValue: raw)
             let specific = type != nil && type != .other && type != .any
+            // A substring-text match with no label is found again by the
+            // selector's own query (cacheQueryElement), so index it there.
+            if let substringMatched, queryNodes[ordinal].label.isEmpty {
+                return QueryIndex.substringLiveIndex(
+                    of: ordinal, in: queryNodes, scopeTypeRaw: specific ? raw : nil, matched: substringMatched
+                )
+            }
             return QueryIndex.liveIndex(of: ordinal, in: queryNodes, scopeTypeRaw: specific ? raw : nil)
         }
 
@@ -757,7 +775,9 @@ class SnapshotElementFinder {
             nodes.append(QueryNode(
                 typeRaw: parseUInt(children[i]["elementType"]) ?? 0,
                 label: children[i]["label"] as? String ?? "",
-                identifier: children[i]["identifier"] as? String ?? ""
+                identifier: children[i]["identifier"] as? String ?? "",
+                title: children[i]["title"] as? String ?? "",
+                value: children[i]["value"] as? String ?? ""
             ))
             numberDescendants(of: &children[i], into: &nodes)
         }
@@ -1392,14 +1412,29 @@ class SnapshotElementFinder {
         } else if let text = selector.text {
             element = resolve(labelQuery(normalizedConcatenatedLabelPredicate(text)))
         } else if let textContains = selector.textContains {
-            // Mirror the snapshot walk's substring match (label/title/value),
-            // whitespace-normalized.
-            let pattern = TextMatch.containsPattern(textContains)
-            let predicate = NSPredicate(
-                format: "label MATCHES %@ OR title MATCHES %@ OR value MATCHES %@",
-                pattern, pattern, pattern
-            )
-            element = resolve(labelQuery(predicate))
+            // A case-insensitive substring (PILOT-522) also matches other
+            // elements, of any type, whose label holds the text; the
+            // type-scoped query below wouldn't return those, so matchIndex
+            // would shift. Re-resolve by the node's own label at its index
+            // in that query, as a role name does.
+            let nodeLabel = snapshotNode?["label"] as? String ?? ""
+            if !nodeLabel.isEmpty, let labelIndex {
+                element = byOwnLabel(nodeLabel, at: labelIndex)
+            } else {
+                // Matched through its title or value: the selector's own
+                // substring query (label/title/value), at the node's index
+                // among the nodes that query returns.
+                let pattern = TextMatch.containsPattern(textContains)
+                let predicate = NSPredicate(
+                    format: "label MATCHES %@ OR title MATCHES %@ OR value MATCHES %@",
+                    pattern, pattern, pattern
+                )
+                if nodeIdentifier.isEmpty, let labelIndex {
+                    element = labelQuery(predicate).element(boundBy: labelIndex)
+                } else {
+                    element = resolve(labelQuery(predicate))
+                }
+            }
         } else if let contentDesc = selector.contentDesc {
             element = resolve(labelQuery(concatenatedLabelPredicate(contentDesc)))
         } else if selector.reResolvesByLabel {

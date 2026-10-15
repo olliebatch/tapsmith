@@ -14,6 +14,14 @@ import { useTapsmithResetEpoch } from "@tapsmith/react-native"
 //   no-break space), for getByRole's name; tapping it counts.
 // - "Full name" is a text field whose accessibility label uses U+00A0, for
 //   getByLabel.
+// - "Get started" renders as "GET STARTED" through textTransform, as the
+//   stock Expo template's button does: a non-exact getByText ignores case
+//   (PILOT-522), so getByText("get started") finds it. Tapping it counts.
+// - "Full name" above the field, also uppercased: getByText("full name")
+//   matches it and the field, two element types (PILOT-522).
+// - "Nickname", uppercased, above a field with no accessibility label: once
+//   text is typed into it, getByText finds the field only through that
+//   value (PILOT-522).
 //
 // Reached by deep link only (not on the home list, so the home cards keep
 // their positions).
@@ -21,7 +29,9 @@ import { useTapsmithResetEpoch } from "@tapsmith/react-native"
 export default function TextMatchingScreen() {
   const [welcomeTaps, setWelcomeTaps] = useState(0)
   const [saveTaps, setSaveTaps] = useState(0)
+  const [startedTaps, setStartedTaps] = useState(0)
   const [name, setName] = useState("")
+  const [nickname, setNickname] = useState("")
 
   // A warm reset navigates here rather than remounting, so clear local state
   // explicitly when the epoch moves.
@@ -30,13 +40,18 @@ export default function TextMatchingScreen() {
     if (resetEpoch === 0) return
     setWelcomeTaps(0)
     setSaveTaps(0)
+    setStartedTaps(0)
     setName("")
+    setNickname("")
   }, [resetEpoch])
 
   return (
     <View style={styles.container}>
       <Text style={styles.heading} onPress={() => setWelcomeTaps((n) => n + 1)}>
         Welcome to&nbsp;Expo
+      </Text>
+      <Text style={styles.uppercase} onPress={() => setStartedTaps((n) => n + 1)}>
+        Get started
       </Text>
       <Text style={styles.body}>{"Line one\nLine two"}</Text>
       <Text style={styles.body}>{"Spaced   out"}</Text>
@@ -48,6 +63,7 @@ export default function TextMatchingScreen() {
       >
         <Text style={styles.buttonText}>Save</Text>
       </Pressable>
+      <Text style={styles.uppercase}>Full name</Text>
       <TextInput
         style={styles.input}
         value={name}
@@ -57,7 +73,17 @@ export default function TextMatchingScreen() {
         autoCorrect={false}
         accessibilityLabel={"Full name"}
       />
+      <Text style={styles.uppercase}>Nickname</Text>
+      <TextInput
+        style={styles.input}
+        value={nickname}
+        onChangeText={setNickname}
+        placeholder="Nickname"
+        autoCapitalize="none"
+        autoCorrect={false}
+      />
       <Text testID="text-matching-counts">{`welcome=${welcomeTaps} save=${saveTaps}`}</Text>
+      <Text testID="text-matching-started">{`started=${startedTaps}`}</Text>
     </View>
   )
 }
@@ -77,6 +103,12 @@ const styles = StyleSheet.create({
   body: {
     fontSize: 16,
     color: "#333",
+  },
+  uppercase: {
+    fontSize: 16,
+    fontWeight: "600",
+    color: "#007AFF",
+    textTransform: "uppercase",
   },
   button: {
     backgroundColor: "#007AFF",
