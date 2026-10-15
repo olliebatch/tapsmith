@@ -4,7 +4,8 @@ import { Check, X, Type, Clock, Play, ExternalLink, MoveHorizontal, ArrowUpDown,
 import type { AnyTraceEvent, ActionTraceEvent, AssertionTraceEvent, GroupTraceEvent, NetworkCaptureRoute, TraceMetadata } from '../../trace/types.js';
 import type { InFlightAction } from '../types.js';
 import { deviceTagStyle } from './device-frames.js';
-import { parseSelectorParts } from './selector-parts.js';
+import { parseSelectorParts, selectorPartsCode, selectorValueCode } from './selector-parts.js';
+import type { SelectorParts } from './selector-parts.js';
 
 interface Props {
   events: AnyTraceEvent[]
@@ -82,8 +83,41 @@ function getInFlightIcon(item: InFlightAction): [ComponentChildren, string] {
 function parseSelectorString(sel: string | undefined): string {
   const parts = parseSelectorParts(sel);
   if (!parts) return sel ?? '';
-  if (parts.optionKey) return `${parts.fn}({ ${parts.optionKey}: "${parts.args[0]}" })`;
-  return `${parts.fn}(${parts.args.map((a, i) => (parts.literal?.[i] ? a : `"${a}"`)).join(', ')})`;
+  return selectorPartsCode(parts);
+}
+
+/**
+ * A locator call, its scope and its options object, highlighted — the same
+ * code {@link selectorPartsCode} writes, for the action list and the Call tab.
+ */
+export function SelectorCall({ parts }: { parts: SelectorParts }) {
+  return (
+    <>
+      {parts.parent && <><SelectorCall parts={parts.parent} />.</>}
+      <span class="sel-fn">{parts.fn}</span>(<SelectorCallArgs parts={parts} />)
+    </>
+  );
+}
+
+function SelectorCallArgs({ parts }: { parts: SelectorParts }) {
+  if (parts.optionKey) {
+    return <>{'{ '}<span class="sel-fn">{parts.optionKey}</span>{': '}<span class="sel-val">{selectorValueCode(parts.args[0], false)}</span>{' }'}</>;
+  }
+  const options = parts.options ?? [];
+  return (
+    <>
+      {parts.args.map((a, i) => (
+        <span key={i}>{i > 0 && ', '}<span class="sel-val">{selectorValueCode(a, parts.literal?.[i])}</span></span>
+      ))}
+      {options.length > 0 && <>
+        {', { '}
+        {options.map((o, i) => (
+          <span key={o.key}>{i > 0 && ', '}<span class="sel-fn">{o.key}</span>{': '}<span class="sel-val">{selectorValueCode(o.value, o.literal)}</span></span>
+        ))}
+        {' }'}
+      </>}
+    </>
+  );
 }
 
 function SelectorDisplay({ sel }: { sel: string | undefined }) {
@@ -92,20 +126,9 @@ function SelectorDisplay({ sel }: { sel: string | undefined }) {
     const plain = sel ?? '';
     return <span class="action-selector-text">{plain || '—'}</span>;
   }
-  if (parts.optionKey) {
-    return (
-      <span class="action-selector-text">
-        <span class="sel-fn">{parts.fn}</span>
-        {'({ '}<span class="sel-fn">{parts.optionKey}</span>{': '}<span class="sel-val">"{parts.args[0]}"</span>{' })'}
-      </span>
-    );
-  }
   return (
     <span class="action-selector-text">
-      <span class="sel-fn">{parts.fn}</span>
-      ({parts.args.map((a, i) => (
-        <span key={i}>{i > 0 && ', '}<span class="sel-val">{parts.literal?.[i] ? a : `"${a}"`}</span></span>
-      ))})
+      <SelectorCall parts={parts} />
     </span>
   );
 }
