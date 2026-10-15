@@ -245,6 +245,14 @@ export const IOS_UNDESCRIBED_OTHER_ROLES: ReadonlySet<string> = new Set([
   'menu', 'menubar', 'menuitem', 'radiogroup', 'scrollbar', 'spinbutton', 'summary', 'tablist', 'timer',
 ]);
 
+/**
+ * The generic-view roles an iOS static text also takes — the agent's
+ * `RoleMapping.staticTextRoles` (PILOT-718), which `roles.test.ts` pins. React
+ * Native's `<Text accessibilityRole="alert">` is plain static text on iOS, so
+ * it is matched as a generic view is: by a description or a named query.
+ */
+export const IOS_STATIC_TEXT_ROLES: ReadonlySet<string> = new Set(['alert']);
+
 const KNOWN = new Set(NATIVE_ROLES);
 
 // ─── Helpers ───
@@ -298,4 +306,26 @@ export function iosGenericViewHasRole(
   const lead = view.value === undefined ? undefined : view.value.split(',')[0]!.trim().toLowerCase();
   if (lead !== undefined && Object.values(IOS_OTHER_ROLE_DESCRIPTIONS).includes(lead)) return lead === own;
   return view.named && view.traitRole === '';
+}
+
+/**
+ * What to add to a "not found" failure of `getByRole(role)` with no name on
+ * iOS, for a role React Native publishes nothing for there — alert, combobox
+ * and the undescribed generic-view roles but tablist — so the miss is explained instead of
+ * looking like a flaky screen (PILOT-718). Empty in every other case. Leads
+ * with a space, ready to append to a sentence.
+ */
+export function iosUnnamedRoleMissHint(
+  role: { role: string; name: string; nameRegex?: unknown },
+  platform: 'android' | 'ios' | undefined,
+): string {
+  if (platform !== 'ios' || role.name !== '' || role.nameRegex !== undefined) return '';
+  const canonical = normalizeRole(role.role);
+  // tablist is left out: the agent matches a native tab bar without a name.
+  const nameOnly = canonical === 'alert' || canonical === 'combobox'
+    || (IOS_UNDESCRIBED_OTHER_ROLES.has(canonical) && canonical !== 'tablist');
+  if (!nameOnly) return '';
+  const quoted = JSON.stringify(role.role);
+  return ` On iOS, React Native publishes no ${quoted} role that getByRole(${quoted}) can see without a name: ` +
+    `pass the element's name — getByRole(${quoted}, { name: "…" }) — or use getByText() or getByTestId().`;
 }
