@@ -255,6 +255,8 @@ See [Environment Variables for Debugging](#environment-variables-for-debugging) 
 Element {"text":"Submit"} was not found after waiting 30000ms
 ```
 
+For a tap (`tap()`, `doubleTap()`, `longPress()`, `setChecked()`), the message usually goes on: `It may be off-screen in a scrollable list: tap() does not scroll, so scroll it into view first with await locator.scrollIntoView() …`. When an unnamed `getByRole()` misses a role that iOS shows only with a name, the message gives that more specific hint instead.
+
 **What happened:** Tapsmith polled the UI hierarchy for 30 seconds and never found an element matching your locator.
 
 **Common causes and fixes:**
@@ -265,11 +267,29 @@ Element {"text":"Submit"} was not found after waiting 30000ms
   await device.getByText("Submit", { exact: true }).tap()
   ```
 - **The locator is wrong** -- the text does not match exactly, or the element uses a different role. Use the trace viewer's Hierarchy tab or the `tapsmith_snapshot` MCP tool to inspect what is actually on screen.
-- **The element is off-screen** -- it exists in the hierarchy but is not scrolled into view. Use `scrollIntoView()`:
+- **The element is off-screen** -- taps do not scroll, unlike a Playwright click, by design so both platforms behave the same. On Android an off-screen row is not in the accessibility tree at all, so a tap reports it not found and says it may be off-screen. Scroll to it first with `scrollIntoView()` (pass `{ direction: "down" }` for a row above the screen), then tap:
   ```typescript
   await device.getByText("Submit", { exact: true }).scrollIntoView()
   await device.getByText("Submit", { exact: true }).tap()
   ```
+
+### Element is off-screen
+
+```
+Element getByText("Item 1", { exact: true }) is off-screen: it was found, but no part of it was on screen after waiting 30000ms. tap() does not scroll, so scroll it into view first with await locator.scrollIntoView({ direction: "down" }), then tap() it.
+```
+
+**What happened:** the element is in the hierarchy (iOS lists off-screen elements) but no part of it was on screen for the whole action timeout. Taps do not scroll for you, so the tap waited for it to come into view and then gave up.
+
+A row that is on screen but clipped by its list, for example scrolled under a header above the list, fails the same way with a slightly different message:
+
+```
+Element getByText("Item 1", { exact: true }) was still not hittable by the end of the 30000ms timeout: it may be clipped by its list (for example behind a header). tap() does not scroll, so scroll it into view first with scroll("up") on the list that holds it (scroll("down") if it is clipped at the bottom), then tap() it.
+```
+
+`scrollIntoView()` cannot help in this case: a clipped row counts as visible, so it returns at once. Move the list itself with `scroll()`.
+
+**Fix:** scroll to it first with `scrollIntoView()`, using the direction the error names, then tap. For an element in a horizontal list, scroll that list with `scroll()`.
 
 ### Timeout: assertion did not pass
 

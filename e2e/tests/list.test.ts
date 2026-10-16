@@ -230,3 +230,38 @@ describe("List screen — scrollIntoView on a modified locator", () => {
     await expect(row).toBeVisible()
   })
 })
+
+// PILOT-716: tap() does not scroll (unlike a Playwright click; by design, the
+// same on both platforms). A row scrolled past waits out the action timeout,
+// then fails with one message that points at scrollIntoView(): definite on iOS,
+// which lists off-screen rows in its tree, and hedged on Android, which does
+// not.
+//
+// Last in the file for the same reason as the describe above: it scrolls the
+// list, and restarts the app to start from the top.
+describe("List screen — tap() on a row scrolled off-screen (PILOT-716)", () => {
+  // Also the action timeout (the runner applies a scope's timeout to the
+  // device default), so the failing tap waits 10 s on both platforms. The
+  // test body keeps 3× the config's timeout (30 s with the local 10 s configs,
+  // 45 s on Android CI, 90 s on iOS CI): a scope timeout only raises that,
+  // never lowers it.
+  test.use({ timeout: 10_000 })
+
+  test("tap() on a row scrolled off-screen fails with the scrollIntoView() advice instead of scrolling", async ({ device, listScreen, platform }) => {
+    await device.resetApp({ mode: "restart", fallback: false })
+    await device.openDeepLink("tapsmithtest:///list")
+    await expect(listScreen.itemCount).toHaveText("30 items")
+
+    await listScreen.item(25).scrollIntoView({ maxScrolls: 8 })
+    await expect(listScreen.item(1)).not.toBeVisible()
+
+    const error = await listScreen.item(1).tap().then(() => null, (e: unknown) => e)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toMatch(
+      platform === "ios"
+        ? /is off-screen: it was found, but no part of it was on screen after waiting \d+ms\. tap\(\) does not scroll, so scroll it into view first with await locator\.scrollIntoView\(\{ direction: "down" \}\), then tap\(\) it\./
+        : /was not found after waiting \d+ms\. It may be off-screen in a scrollable list: tap\(\) does not scroll, so scroll it into view first with await locator\.scrollIntoView\(\)/,
+    )
+    await expect(listScreen.selectedCount).toContainText("0 selected")
+  })
+})

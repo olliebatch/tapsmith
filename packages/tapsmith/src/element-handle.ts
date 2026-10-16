@@ -605,6 +605,78 @@ function anonymousIdentity(el: ElementInfo): string {
  */
 type ActionTarget = { selector: Selector } | { elementId: string };
 
+// ─── Off-screen targets of tap-family actions (PILOT-716) ───
+
+/** The actions that wait for an enabled target before touching it. */
+type TapFamilyAction = 'tap' | 'doubleTap' | 'longPress' | 'setChecked';
+
+/**
+ * Whether the platform reports `el` in the tree with no part of it on screen
+ * (iOS: viewport ratio 0; Android's tree holds on-screen nodes only). An
+ * element without bounds or with a zero-size frame is invisible for another
+ * reason and is left to the action, as before.
+ */
+function isOffScreen(el: ElementInfo): boolean {
+  const b = el.bounds;
+  return !el.visible && !!b && b.right > b.left && b.bottom > b.top;
+}
+
+/**
+ * The advice both platforms give when a tap-family action cannot reach its
+ * element because it may be off-screen. Tapsmith's taps do not scroll, unlike
+ * a Playwright click: Android cannot see an off-screen row to scroll to, so
+ * neither platform does, and scrolling stays the caller's explicit step.
+ */
+function scrollFirstAdvice(action: TapFamilyAction, how: string): string {
+  return `${action}() does not scroll, so scroll it into view first with ${how}, then ${action}() it.`;
+}
+
+/** The not-found hint: the element may be off-screen in a scrollable list (Android never lists such rows). */
+function offScreenHint(action: TapFamilyAction): string {
+  return 'It may be off-screen in a scrollable list: ' +
+    scrollFirstAdvice(action, 'await locator.scrollIntoView() (scrollIntoView({ direction: "down" }) for one above the screen)');
+}
+
+/** How often a refused tap-family dispatch is retried. */
+const NOT_HITTABLE_RETRY_MS = 1000;
+/** The error type of the advice a still-refused dispatch ends with. */
+const NOT_HITTABLE_ERROR_TYPE = 'ELEMENT_NOT_HITTABLE';
+
+/**
+ * The agents' refusals of a touch on an element they cannot hit at all: off
+ * the screen, or clipped by its list (behind a header) — iOS still calls a
+ * clipped row "visible", so the auto-wait cannot see it coming. The iOS
+ * agent words tap()'s refusal with the reason, doubleTap()'s and
+ * longPress()'s without.
+ */
+function isNotHittableRefusal(message: string | undefined): boolean {
+  return message === 'Element is not hittable (may be off-screen or hidden)' || message === 'Element is not hittable' ||
+    // Android's agent, for a fully clipped node (one its list hides), after
+    // waiting out the budget: tap() in one wording, doubleTap()/longPress() in
+    // another. The same advice applies.
+    !!message?.includes('is not visible on screen (scrolled off, hidden, or fully clipped)') ||
+    !!message?.includes('element has empty visible bounds (zero-size, fully clipped, or off screen)');
+}
+
+/**
+ * The deadline error for an element found in the tree but entirely
+ * off-screen (iOS reports such nodes): definite, with the way to scroll to
+ * it that the element's position tells.
+ */
+function offScreenError(desc: string, timeoutMs: number, action: TapFamilyAction, bounds: ElementInfo['bounds']): Error {
+  // Above or left of the screen is certain from the frame; below and right of
+  // it look alike without the screen's width, so that advice covers both.
+  const how = bounds && bounds.bottom <= 0
+    ? 'await locator.scrollIntoView({ direction: "down" })'
+    : bounds && bounds.right <= 0
+      ? 'scroll("left") on the horizontal list that holds it'
+      : 'await locator.scrollIntoView() (or scroll("right") on the horizontal list that holds it, if it is off to the side)';
+  return new Error(
+    `Element ${desc} is off-screen: it was found, but no part of it was on screen after waiting ${timeoutMs}ms. ` +
+      scrollFirstAdvice(action, how),
+  );
+}
+
 /**
  * @internal — Whether an action failure means the agent's cached element is no
  * longer usable, so re-resolving to a fresh id and retrying may succeed. Covers
@@ -1531,12 +1603,19 @@ export class ElementHandle {
    *
    * Throws if the element is not found or still disabled after the timeout.
    */
-  private async _waitForEnabled(): Promise<{ remainingMs: number; element?: ElementInfo }> {
+  private async _waitForEnabled(
+    action: TapFamilyAction,
+    options?: {
+      offScreenOk?: (el: ElementInfo) => boolean;
+      /** Wait until this time instead of a fresh timeout (a retried dispatch, see `_untilHittable`). */
+      deadline?: number;
+    },
+  ): Promise<{ remainingMs: number; element?: ElementInfo }> {
     const timeoutMs = this._timeoutMs;
     // timeoutMs === 0 means "no polling": behave like the pre-auto-wait code
     // and hand the full zero budget straight to the action.
     if (timeoutMs === 0) return { remainingMs: 0 };
-    const deadline = Date.now() + timeoutMs;
+    const deadline = options?.deadline ?? Date.now() + timeoutMs;
     let lastSeenDisabled = false;
     let lastTransientErr: Error | undefined;
     // The most recent positional miss (`nth(i): expected at least …`), kept so
@@ -1544,6 +1623,11 @@ export class ElementHandle {
     // the same diagnostic _strictResolve gives `type()`, so `nth(5).tap()`
     // does not fail with a worse message than `nth(5).type()`.
     let lastPositionalMiss: Error | undefined;
+    // An element found but entirely off-screen (iOS) is waited on like a
+    // disabled one — it may scroll or animate into view — and reported as
+    // off-screen at the deadline, instead of being handed to the agent, which
+    // refused it at once as "not hittable" (PILOT-716).
+    let lastSeenOffScreen: ElementInfo['bounds'];
     while (true) {
       const tick = await this._resolveTick(tickBudget(deadline));
       if (tick.kind === 'fault') {
@@ -1567,11 +1651,17 @@ export class ElementHandle {
         if (tick.kind === 'miss') {
           lastPositionalMiss = tick.positionalMiss;
           lastSeenDisabled = false;
+          lastSeenOffScreen = undefined;
         }
         if (tick.kind === 'found') {
           lastPositionalMiss = undefined;
           lastSeenDisabled = !tick.element.enabled;
-          if (tick.element.enabled) {
+          // setChecked() on an element already in the requested state does
+          // not touch it, so it need not be on screen.
+          lastSeenOffScreen = tick.element.enabled && isOffScreen(tick.element) && !options?.offScreenOk?.(tick.element)
+            ? tick.element.bounds
+            : undefined;
+          if (tick.element.enabled && !lastSeenOffScreen) {
             const remaining = Math.max(0, deadline - Date.now());
             return {
               remainingMs: Math.min(timeoutMs, Math.max(remaining, MIN_ACTION_BUDGET_MS)),
@@ -1583,10 +1673,14 @@ export class ElementHandle {
       if (Date.now() >= deadline) {
         if (lastTransientErr) throw lastTransientErr;
         const desc = this._describe();
+        if (lastSeenOffScreen) throw offScreenError(desc, timeoutMs, action, lastSeenOffScreen);
         throw new Error(
           lastSeenDisabled
             ? `Element ${desc} is disabled after waiting ${timeoutMs}ms`
-            : `Element ${desc} was not found after waiting ${timeoutMs}ms${positionalMissDetail(lastPositionalMiss)}${this._roleMissHint()}`,
+            // A known cause (an unnamed role iOS cannot see, PILOT-718) is told
+            // instead of the generic off-screen hint.
+            : `Element ${desc} was not found after waiting ${timeoutMs}ms${positionalMissDetail(lastPositionalMiss)}` +
+              (this._roleMissHint() || `. ${offScreenHint(action)}`),
         );
       }
       const sleepMs = Math.min(POLL_INTERVAL_MS, Math.max(0, deadline - Date.now()));
@@ -2141,6 +2235,55 @@ export class ElementHandle {
    */
   private _resolvedActionIndex: number | undefined;
 
+  /**
+   * @internal — Run a tap-family dispatch, retrying while the agent refuses
+   * the element as not hittable (PILOT-716): a row its list clips behind a
+   * header is still "visible" to the auto-wait, so the agent is the one to
+   * refuse it — and the refusal is waited out until the action's deadline,
+   * like an off-screen element, not returned at once. A refusal means nothing
+   * was touched. Before each retry the whole auto-wait runs again, to the same
+   * deadline — strict mode, enabled, on screen, a fresh target — so a retry
+   * never taps another match, a disabled control or a stale id, and a target
+   * that vanished, turned disabled or went off-screen fails as exactly that.
+   * Still refused at the deadline, the response carries the same
+   * scrollIntoView() advice as the off-screen error, under its own type.
+   */
+  private async _untilHittable(
+    action: TapFamilyAction,
+    remainingMs: number,
+    first: ActionTarget,
+    dispatch: (target: ActionTarget, element?: ElementInfo) => Promise<ActionResponse>,
+    options?: { offScreenOk?: (el: ElementInfo) => boolean },
+  ): Promise<ActionResponse> {
+    const deadline = Date.now() + remainingMs;
+    const refusedAtDeadline = (res: ActionResponse): ActionResponse => ({
+      ...res,
+      // Its own type: the message embeds the locator, whose text must not be
+      // read as the agent's (setChecked() looks for "stale" in it).
+      errorType: NOT_HITTABLE_ERROR_TYPE,
+      errorMessage:
+        `Element ${this._describe()} was still not hittable by the end of the ${this._timeoutMs}ms timeout: ` +
+        'it may be clipped by its list (for example behind a header). ' +
+        // scrollIntoView() would not help: a clipped row counts as visible, so
+        // it returns at once. The list itself has to move.
+        scrollFirstAdvice(action, 'scroll("up") on the list that holds it (scroll("down") if it is clipped at the bottom)'),
+    });
+    let res = await dispatch(first);
+    for (;;) {
+      // timeout 0 keeps its no-wait behaviour: the agent's refusal as it is.
+      if (res.success || remainingMs <= 0 || !isNotHittableRefusal(res.errorMessage)) return res;
+      if (Date.now() >= deadline) return refusedAtDeadline(res);
+      // Each refusal costs the daemon an error screenshot: retry at a slower
+      // pace than the read-only auto-wait.
+      await sleep(Math.min(NOT_HITTABLE_RETRY_MS, Math.max(0, deadline - Date.now())), this._client._getAbortSignal?.());
+      // No retry is started at the deadline: its one read could misreport the
+      // element, and its touch would land after the timeout.
+      if (Date.now() >= deadline) return refusedAtDeadline(res);
+      const { element } = await this._waitForEnabled(action, { ...options, deadline });
+      res = await dispatch(await this._actionTarget(element), element);
+    }
+  }
+
   /** @internal — Wrap an action with trace recording. */
   private async _tracedAction(
     action: string,
@@ -2240,27 +2383,27 @@ export class ElementHandle {
 
   async tap(): Promise<void> {
     const { target, remainingMs } = await this._tracedResolve('tap', 'tap', async () => {
-      const { remainingMs, element } = await this._waitForEnabled();
+      const { remainingMs, element } = await this._waitForEnabled('tap');
       return { target: await this._actionTarget(element), remainingMs };
     });
     const budget = actionBudget(remainingMs);
     return this._tracedAction('tap', 'tap',
-      () => this._dispatchTargeted(target, (t) => 'elementId' in t
+      () => this._untilHittable('tap', remainingMs, target, (to) => this._dispatchTargeted(to, (t) => 'elementId' in t
         ? this._client.tap(undefined, budget(), t.elementId)
-        : this._client.tap(t.selector, budget())),
+        : this._client.tap(t.selector, budget()))),
       'Tap failed');
   }
 
   async longPress(durationMs?: number): Promise<void> {
     const { target, remainingMs } = await this._tracedResolve('longPress', 'tap', async () => {
-      const { remainingMs, element } = await this._waitForEnabled();
+      const { remainingMs, element } = await this._waitForEnabled('longPress');
       return { target: await this._actionTarget(element), remainingMs };
     });
     const budget = actionBudget(remainingMs);
     return this._tracedAction('longPress', 'tap',
-      () => this._dispatchTargeted(target, (t) => 'elementId' in t
+      () => this._untilHittable('longPress', remainingMs, target, (to) => this._dispatchTargeted(to, (t) => 'elementId' in t
         ? this._client.longPress(undefined, durationMs, budget(), t.elementId)
-        : this._client.longPress(t.selector, durationMs, budget())),
+        : this._client.longPress(t.selector, durationMs, budget()))),
       'Long press failed');
   }
 
@@ -2321,7 +2464,7 @@ export class ElementHandle {
 
   async doubleTap(options?: { intervalMs?: number }): Promise<void> {
     const { target, remainingMs } = await this._tracedResolve('doubleTap', 'tap', async () => {
-      const { remainingMs, element } = await this._waitForEnabled();
+      const { remainingMs, element } = await this._waitForEnabled('doubleTap');
       return { target: await this._actionTarget(element), remainingMs };
     });
     // 0 on the wire = "use agent default (100ms)". User-supplied values
@@ -2329,9 +2472,9 @@ export class ElementHandle {
     const intervalMs = Math.max(0, options?.intervalMs ?? this._options.doubleTapInterval ?? 0);
     const budget = actionBudget(remainingMs);
     return this._tracedAction('doubleTap', 'tap',
-      () => this._dispatchTargeted(target, (t) => 'elementId' in t
+      () => this._untilHittable('doubleTap', remainingMs, target, (to) => this._dispatchTargeted(to, (t) => 'elementId' in t
         ? this._client.doubleTap(undefined, budget(), intervalMs, t.elementId)
-        : this._client.doubleTap(t.selector, budget(), intervalMs)),
+        : this._client.doubleTap(t.selector, budget(), intervalMs))),
       'Double tap failed');
   }
 
@@ -2375,7 +2518,9 @@ export class ElementHandle {
     const deadline = Date.now() + timeoutMs;
 
     const { target, remainingMs, alreadySet } = await this._tracedResolve('setChecked', 'tap', async () => {
-      const { remainingMs, element } = await this._waitForEnabled();
+      const { remainingMs, element } = await this._waitForEnabled('setChecked', {
+        offScreenOk: (el) => el.checked === checked,
+      });
       // The timeout-0 path skips the wait and returns no element; resolve here.
       const el = element ?? await this._resolveOne();
       return { target: await this._actionTarget(el), remainingMs, alreadySet: el.checked === checked };
@@ -2400,17 +2545,25 @@ export class ElementHandle {
       // cached id we re-resolve, but DON'T tap if the element is already in the
       // desired state: the change that staled it may have set it, and tapping
       // would toggle it the wrong way (cf. _dispatchTargeted, which re-taps).
-      let tapRes: ActionResponse;
-      try {
-        tapRes = await tapByTarget(target);
-      } catch (err) {
+      // A refused tap touched nothing; before trying again, the retry re-reads
+      // the switch — the app may have set it meanwhile, and tapping would
+      // toggle it the wrong way. Only the tap's own stale error is caught here:
+      // what the retry's auto-wait throws (not found, disabled, off-screen)
+      // quotes the locator and must propagate as itself.
+      const tapRes0 = (to: ActionTarget): Promise<ActionResponse> => tapByTarget(to).catch((err: unknown) => {
         const msg = err instanceof Error ? err.message : String(err);
         if (!isStaleElementError(msg)) throw err;
-        tapRes = synthetic(false, msg);
-      }
+        return synthetic(false, msg);
+      });
+      let tapRes = await this._untilHittable('setChecked', remainingMs, target, async (to, fresh) =>
+        fresh?.checked === checked ? synthetic(true) : tapRes0(to),
+      { offScreenOk: (el) => el.checked === checked });
       // A covered target (PILOT-223) is never stale, whatever its cover's
       // label says (see _dispatchTargeted).
-      if (!tapRes.success && tapRes.errorType !== 'ELEMENT_COVERED' && isStaleElementError(tapRes.errorMessage)) {
+      if (
+        !tapRes.success && tapRes.errorType !== 'ELEMENT_COVERED' && tapRes.errorType !== NOT_HITTABLE_ERROR_TYPE &&
+        isStaleElementError(tapRes.errorMessage)
+      ) {
         const fresh = await this._resolveOne();
         if (fresh.checked === checked) return synthetic(true); // already set after the change
         tapRes = await tapByTarget(await this._actionTarget(fresh));
@@ -2432,7 +2585,11 @@ export class ElementHandle {
       let retaps = 0;
       let lastTapAt = Date.now();
       let lastTransientErr: Error | undefined;
-      while (Date.now() < deadline) {
+      // A tap that landed at or past the deadline (one the agent refused as
+      // not hittable until then) still gets the action floor to see its change
+      // land, so a toggle that worked is not reported as unchanged.
+      const verifyUntil = Math.max(deadline, lastTapAt + MIN_ACTION_BUDGET_MS);
+      while (Date.now() < verifyUntil) {
         await sleep(POLL_INTERVAL_MS, this._client._getAbortSignal?.());
         try {
           const after = await this._resolveOne();
