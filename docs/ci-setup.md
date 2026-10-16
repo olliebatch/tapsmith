@@ -13,10 +13,14 @@ To run Tapsmith tests in CI, you need:
 
 ## GitHub Actions (Android)
 
-Here is a complete GitHub Actions workflow that builds your app, starts an emulator, and runs Tapsmith tests.
+Here is a complete GitHub Actions workflow that builds a React Native app, starts an emulator, and
+runs Tapsmith tests. It works as pasted in a React Native CLI project and in an Expo project, whether
+or not the project commits its `android/` directory: when `android/` is missing (Expo's
+[Continuous Native Generation](https://docs.expo.dev/workflow/continuous-native-generation/)), the
+workflow generates it with `npx expo prebuild`.
 
 ```yaml
-name: Mobile Tests
+name: Android Tests
 
 on:
   push:
@@ -27,7 +31,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -47,8 +51,17 @@ jobs:
           distribution: "temurin"
           java-version: "17"
 
-      - name: Build APK
-        run: ./gradlew assembleDebug
+      # Expo projects that don't commit android/ generate it here.
+      - name: Generate the native project (Expo)
+        if: hashFiles('android/gradlew') == ''
+        run: npx expo prebuild --platform android
+
+      # A release build bundles the JavaScript into the APK. A debug build
+      # loads it from the Metro dev server, which isn't running in CI.
+      # Building only the emulator's ABI (x86_64) cuts the build time.
+      - name: Build the release APK
+        working-directory: android
+        run: ./gradlew assembleRelease -PreactNativeArchitectures=x86_64
 
       - name: Enable KVM
         run: |
@@ -56,7 +69,7 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Start emulator
+      - name: Start the emulator and run the tests
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 33
@@ -73,11 +86,47 @@ jobs:
           retention-days: 14
 ```
 
+The matching config points `apk` at the APK the workflow builds. Set `package` to your app's
+`applicationId` (in `android/app/build.gradle`). In an Expo project that doesn't commit `android/`,
+set `android.package` in `app.json` and use that: without it, `expo prebuild` makes an ID up from
+the account it runs as, so it differs between your machine and CI.
+
+```typescript
+// tapsmith.config.ts
+import { defineConfig } from "tapsmith";
+
+export default defineConfig({
+  apk: "./android/app/build/outputs/apk/release/app-release.apk",
+  package: "com.example.myapp",
+  timeout: 60_000, // CI emulators are slower than a developer machine
+});
+```
+
 ### Key Points
 
-- **KVM acceleration** is required for acceptable emulator performance on Linux CI runners. The `Enable KVM` step configures this.
-- The `android-emulator-runner` action handles downloading the system image, creating the AVD, and starting the emulator. Your test command runs in the `script` parameter after the emulator boots.
+- **Release build.** A debug APK loads its JavaScript from the Metro dev server, so in CI the app
+  opens on an error screen instead of your UI. React Native CLI and Expo projects both sign release builds with the
+  debug keystore until you configure your own, so the APK installs on an emulator as it is.
+- **Native project.** The `if: hashFiles('android/gradlew') == ''` condition runs `expo prebuild`
+  only when the project does not commit `android/`; a React Native CLI project (or an Expo project
+  that commits it) skips the step.
+- **KVM acceleration** is required for acceptable emulator performance on Linux CI runners. The
+  `Enable KVM` step configures this.
+- The `android-emulator-runner` action handles downloading the system image, creating the AVD, and
+  starting the emulator. Your test command runs in the `script` parameter after the emulator boots.
 - The `if: always()` on the upload step ensures screenshots are uploaded even when tests fail.
+- The workflow uses npm. With Yarn or pnpm, change the `cache` input and the install command (for
+  example `yarn install --frozen-lockfile`).
+- **What a release build turns off.** `__DEV__` is false in a release build, so anything your app
+  enables only in development is off in CI. Two things Tapsmith uses:
+  - the [`@tapsmith/react-native` reset hooks](warm-reset.md#release-builds-for-e2e). In an Expo
+    project, keep them by setting `EXPO_PUBLIC_TAPSMITH_HOOKS: "1"` in the `env` of the build step
+    (only in the job that builds your test app, never a store build). A React Native CLI project's
+    Babel preset does not inline that variable: add a Babel plugin that does (such as
+    `babel-plugin-transform-inline-environment-variables`), or set the provider's `enabled` prop from
+    a flag your own build already passes.
+  - [WebView debugging](webview.md), which `device.webview()` needs: a
+    `webviewDebuggingEnabled={__DEV__}` prop must be enabled for the test build too.
 
 ### Letting Tapsmith launch the emulator
 
@@ -90,12 +139,15 @@ the emulator itself — the same setup as on a developer machine, and the one
 import { defineConfig } from "tapsmith";
 
 export default defineConfig({
-  apk: "./app-debug.apk",
+  apk: "./android/app/build/outputs/apk/release/app-release.apk",
   package: "com.example.myapp",
   avd: "Tapsmith_Phone_API_36", // launchEmulators defaults to true when avd is set
   timeout: 60_000,
 });
 ```
+
+These steps replace the workflow's `Enable KVM` and `Start the emulator and run the tests` steps
+(keep `Upload test artifacts` after them):
 
 ```yaml
       - name: Enable KVM
@@ -130,7 +182,13 @@ through `tapsmith create-avd --install-tools`.
 
 ## GitHub Actions (iOS)
 
-iOS tests require a macOS runner with Xcode installed. Tapsmith manages simulator lifecycle automatically.
+iOS tests require a macOS runner with Xcode installed. Tapsmith manages the simulator lifecycle
+automatically. Like the Android workflow, this one works as pasted in a React Native CLI project and
+in an Expo project, generating `ios/` with `npx expo prebuild` when the project does not commit it.
+Replace `MyApp` with your app's name — the name of the `.xcworkspace` in `ios/`, which is also its
+scheme and the name of the built `.app`. In an Expo project that doesn't commit `ios/`, `expo prebuild`
+derives that name from `name` in `app.json` and drops characters Xcode can't use, so run
+`npx expo prebuild --platform ios` once locally and use the name of the `.xcworkspace` it creates:
 
 ```yaml
 name: iOS Tests
@@ -143,8 +201,8 @@ on:
 
 jobs:
   test:
-    runs-on: macos-latest
-    timeout-minutes: 30
+    runs-on: macos-26
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@v4
@@ -158,21 +216,32 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # Required for iOS network capture — see "iOS network capture on CI" below.
-      - name: Install mitmproxy (for iOS network capture redirector)
-        if: ${{ true }} # omit this step if you disable network capture in the trace config
-        run: |
-          brew install mitmproxy
-          sudo mitmproxy --mode local:Safari <<< 'q' || true
-          # The redirector System Extension needs pre-approval on self-hosted runners;
-          # GitHub-hosted macOS runners accept new SEs automatically on first launch.
+      # Expo projects that don't commit ios/ generate it here.
+      - name: Generate the native project (Expo)
+        if: hashFiles('ios/Podfile') == ''
+        run: npx expo prebuild --platform ios --no-install
 
-      - name: Build app for simulator
+      - name: Install CocoaPods
+        working-directory: ios
+        run: pod install
+
+      # A Release build bundles the JavaScript into the app. A Debug build
+      # loads it from the Metro dev server, which isn't running in CI.
+      # -derivedDataPath puts the .app where tapsmith.config.ts expects it.
+      # ARCHS=arm64 builds only the Apple-silicon simulator slice the runner
+      # needs; a Release build otherwise compiles x86_64 too, doubling the time.
+      - name: Build the app for the simulator
+        working-directory: ios
         run: |
-          xcodebuild build-for-testing \
-            -project MyApp.xcodeproj \
+          xcodebuild build \
+            -workspace MyApp.xcworkspace \
             -scheme MyApp \
-            -destination 'platform=iOS Simulator,name=iPhone 17'
+            -configuration Release \
+            -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath build \
+            ARCHS=arm64 \
+            -quiet
 
       - name: Run Tapsmith tests
         run: npx tapsmith test
@@ -186,21 +255,68 @@ jobs:
           retention-days: 14
 ```
 
+The matching config points `app` at the `.app` bundle the workflow builds. Set `package` to your
+app's bundle identifier (`PRODUCT_BUNDLE_IDENTIFIER` in Xcode, or `ios.bundleIdentifier` in an Expo
+project's `app.json`, which, as on Android, you should set rather than leave to `expo prebuild`), and
+`simulator` to a simulator the runner's Xcode has:
+
+```typescript
+// tapsmith.config.ts
+import { defineConfig } from "tapsmith";
+
+export default defineConfig({
+  platform: "ios",
+  app: "./ios/build/Build/Products/Release-iphonesimulator/MyApp.app",
+  package: "com.example.myapp",
+  simulator: "iPhone 17",
+  timeout: 60_000,
+});
+```
+
 ### Key Points
 
-- **macOS runner** is required for iOS simulators. GitHub provides `macos-latest` with Xcode pre-installed.
+- **macOS runner** is required for iOS simulators. The workflow pins `macos-26`, whose Xcode has the
+  `iPhone 17` simulator the config names; if you change the runner image, check the simulator names
+  it has (`xcrun simctl list devices available`) and update `simulator` to match. `ARCHS=arm64`
+  assumes an Apple-silicon runner, as `macos-26` is; drop it on an Intel one.
+- **Time.** A stock Expo app took about 25 minutes end to end on `macos-26`: around 10 for the
+  build, and around 10 for Tapsmith's first-run setup (booting the simulator, then installing and
+  starting its XCUITest agent). A larger app's build takes longer; raise `timeout-minutes` to suit.
+- **Release build and a fixed output path.** Without `-derivedDataPath`, `xcodebuild` puts the
+  `.app` under `~/Library/Developer/Xcode/DerivedData/<name>-<hash>/`, a path the config cannot name.
+  `-workspace` (not `-project`) is needed because React Native projects build their dependencies
+  through CocoaPods.
+- **Native project.** `expo prebuild --no-install` generates `ios/` without installing pods, so the
+  `Install CocoaPods` step does that for both project kinds.
+- **Release build caveats.** As on Android, `__DEV__` is false: keep the
+  [reset hooks](warm-reset.md#release-builds-for-e2e) and WebView debugging on in the test build as
+  [the Android notes](#key-points) describe, with `EXPO_PUBLIC_TAPSMITH_HOOKS: "1"` on this build step
+  in an Expo project.
 - Tapsmith boots and manages simulators automatically -- no manual `xcrun simctl` setup needed. Tapsmith's own CI checks this weekly and on changes to its simulator-provisioning code: it starts with no simulator booted and verifies that Tapsmith booted the configured one.
 - With `workers` above 1, Tapsmith boots a simulator for each extra worker (another simulator of the same name and OS, or a clone of the configured one). The standard 3-core GitHub-hosted macOS runner cannot run two simulators at usable speed (app installs and XCUITest launches time out), so keep `workers: 1` there or use a larger runner. Tapsmith's CI does not cover multiple simulators on hosted runners for this reason.
-- Build your app for the iOS Simulator target (not a physical device) using `build-for-testing` or your existing build pipeline.
 
 ### iOS network capture on CI
 
-iOS network capture (trace + `network.json` in the trace viewer) routes simulator traffic through Tapsmith's MITM proxy via a macOS **Network Extension** redirector that is bundled with [mitmproxy](https://mitmproxy.org). You need two one-time prerequisites on the CI runner for this to work:
+iOS network capture (trace + `network.json` in the trace viewer) needs no setup step on a
+GitHub-hosted runner. On a developer Mac, Tapsmith routes each simulator's traffic through a macOS
+**Network Extension** redirector (bundled with [mitmproxy](https://mitmproxy.org)) that captures that
+simulator's traffic only. When the redirector is unavailable and the `CI` environment variable is set,
+as it is on GitHub Actions, Tapsmith falls back to the macOS system proxy instead. That fallback is
+host-wide: the trace can also hold the runner's own traffic, the trace records
+`"networkCaptureRoute": "ios-system-proxy"`, and the trace viewer flags it. Tapsmith's own iOS CI
+runs this way. See [When the Network Extension is unavailable](./ios-network-capture.md#when-the-network-extension-is-unavailable)
+for the details.
 
-1. **`brew install mitmproxy`** — Tapsmith discovers the redirector at `/Applications/Mitmproxy Redirector.app` (mitmproxy's installer unpacks it there) or via `$TAPSMITH_REDIRECTOR_APP`. Alternatively, it will extract the redirector from mitmproxy's brew cask tarball into `~/.tapsmith/redirector/` on first use.
-2. **System Extension approval** — the redirector's Network Extension must be approved on first launch. On **GitHub-hosted macOS runners**, SEs are accepted automatically on first launch, so no action is needed. On **self-hosted runners**, run `sudo systemextensionsctl developer on` once to bypass interactive approval, or pre-approve the extension manually.
+The fallback is not device-isolated, so a [multi-device group](./ios-network-capture.md#multi-device-groups)
+refuses it. For per-device capture, use a self-hosted runner with the redirector set up once:
+`brew install mitmproxy` (Tapsmith extracts the redirector from mitmproxy's cask), then approve its
+System Extension by hand in System Settings, as the
+[first-run setup](./ios-network-capture.md#first-run-setup) describes. Don't add an
+interactive `mitmproxy` command to a workflow: with no terminal it waits forever and the job hangs
+until it times out.
 
-If your tests do not need network capture, disable it in your tapsmith config (`trace: { network: false }`) and skip the mitmproxy install step above.
+If your tests do not need network capture, disable it in your tapsmith config
+(`trace: { network: false }`).
 
 See [iOS network capture](./ios-network-capture.md) for the full first-run walkthrough and troubleshooting.
 
@@ -258,7 +374,7 @@ CI emulators are slower than local machines. Increase the default timeout in you
 import { defineConfig } from "tapsmith";
 
 export default defineConfig({
-  apk: "./app-debug.apk",
+  apk: "./android/app/build/outputs/apk/release/app-release.apk",
   timeout: 60_000, // 60 seconds for CI
   retries: 2, // Retry flaky tests
 });
@@ -272,7 +388,7 @@ import { defineConfig } from "tapsmith";
 const isCI = process.env.CI === "true";
 
 export default defineConfig({
-  apk: "./app-debug.apk",
+  apk: "./android/app/build/outputs/apk/release/app-release.apk",
   timeout: isCI ? 60_000 : 30_000,
   retries: isCI ? 2 : 0,
   screenshot: isCI ? "always" : "only-on-failure",
@@ -324,7 +440,7 @@ npx tapsmith show-trace tapsmith-results/traces/trace-login_test.zip
 
 Or drop the `.zip` file onto [trace.tapsmith.dev](https://trace.tapsmith.dev) to view it in the browser without installing anything.
 
-Network capture works in CI as well -- HTTP/HTTPS requests made by the app are recorded in the trace and visible in the Network tab of the trace viewer. **Android** runs need no extra setup; **iOS** runs need `brew install mitmproxy` and (on self-hosted runners) a pre-approved System Extension — see [iOS network capture on CI](#ios-network-capture-on-ci) above.
+Network capture works in CI as well -- HTTP/HTTPS requests made by the app are recorded in the trace and visible in the Network tab of the trace viewer. **Android** runs need no extra setup, and neither do **iOS** runs on GitHub-hosted runners, where capture goes through the host-wide macOS system proxy — see [iOS network capture on CI](#ios-network-capture-on-ci) above.
 
 ### Caching
 
@@ -349,7 +465,7 @@ device or emulator instance. The recommended emulator-managed setup is:
 import { defineConfig } from "tapsmith";
 
 export default defineConfig({
-  apk: "./app-debug.apk",
+  apk: "./android/app/build/outputs/apk/release/app-release.apk",
   package: "com.example.myapp",
   workers: 4,
   launchEmulators: true,
