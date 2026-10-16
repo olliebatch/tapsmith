@@ -4,7 +4,8 @@ import * as path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import Enquirer from 'enquirer';
 import figlet from 'figlet';
-import { tryExec, scanEnvironment, simulatorChoices, type EnvScan } from './env-scan.js';
+import { isCustomSimulatorName, scanEnvironment, simulatorChoices, type EnvScan } from './env-scan.js';
+import type { SeStatus } from './setup-ios.js';
 import {
   detectAndroidPackage,
   detectExpoProject,
@@ -19,8 +20,8 @@ import {
 import { adbMissingFix } from './toolchain.js';
 import type { InitCommandOptions } from './cli-program.js';
 import { formatJson, jsonError } from './cli-json.js';
-import { avdCaptureSupport, avdCaptureWarning, captureAvdNextStep, noAvdsListedMessage, type AvdImageInfo } from './avd-images.js';
-import { isTapsmithResolvableFrom, tapsmithInstallCommand, type InstallCommand } from './config.js';
+import { avdCaptureSupport, avdCaptureWarning, captureAvdNextStep, noAvdsListedMessage, preferredAvd, type AvdImageInfo } from './avd-images.js';
+import { isTapsmithResolvableFrom, tapsmithExecCommand, tapsmithInstallCommand, type InstallCommand } from './config.js';
 import { androidAgentInstalledFor, missingAndroidAgentAdvice } from './agent-resolve.js';
 import { globSync } from 'glob';
 import { minimatch } from 'minimatch';
@@ -201,7 +202,8 @@ function orderApkCandidates(candidates: string[]): string[] {
 export type Platform = 'android' | 'ios';
 
 export interface AndroidConfig {
-  apkPath: string;
+  /** Unset for a package-only config: the app is installed already (PILOT-721). */
+  apkPath?: string;
   packageName?: string;
   useEmulators: boolean;
   usePhysicalDevices: boolean;
@@ -215,6 +217,11 @@ export interface IosConfig {
   /** The device build's bundle id, when it differs from `bundleId` (per-configuration ids). */
   deviceBundleId?: string;
   simulator?: string;
+  /**
+   * Set when `simulator` is a custom name, only on this Mac (PILOT-721): the
+   * simulator's device type, which the config's comment offers instead.
+   */
+  simulatorDeviceType?: string;
   usePhysicalDevice: boolean;
   /** Device-signed (iphoneos) build; set whenever `usePhysicalDevice` is. */
   deviceAppPath?: string;
@@ -224,9 +231,9 @@ export interface IosConfig {
 
 /**
  * The wizard's AVD picker: list order kept, Google Play images marked (HTTPS
- * is never captured on them), and a capture-capable AVD pre-selected. The
- * capture question comes later and defaults to yes on a capable AVD, so the
- * picker always prefers one.
+ * is never captured on them), and the AVD `init --yes` would choose
+ * pre-selected ({@link preferredAvd}: a capture-capable one first). The
+ * capture question comes later and defaults to yes on a capable AVD.
  */
 export function avdPickerChoices(
   avds: string[],
@@ -236,8 +243,8 @@ export function avdPickerChoices(
   const choices = avds.map((name, i) => (support[i] === 'play-image'
     ? { name, message: name, hint: 'no HTTPS capture' }
     : { name, message: name }));
-  const firstCapable = support.indexOf('capable');
-  return { choices, initial: firstCapable === -1 ? 0 : firstCapable };
+  const preferred = preferredAvd(avds, avdImages);
+  return { choices, initial: preferred === undefined ? 0 : avds.indexOf(preferred) };
 }
 
 /**
@@ -275,11 +282,53 @@ export function androidEmulatorCaptureLine(avd: string | undefined, avdImages: A
     : `  ${green('✓')} Android emulator (${avd}) — works automatically`;
 }
 
+// ─── Platform choice (PILOT-721) ───
+
+/**
+ * The platform prompt: Android, and on macOS iOS and Both, each that cannot
+ * run here hinted with why, and a default that can. The project's layout
+ * narrows it (an `ios/`-only project means iOS, both directories mean Both,
+ * as `init --yes` infers), then the toolchains: Android needs adb, iOS needs
+ * Xcode and a simulator. A project with neither directory gets Android when
+ * adb is there, else iOS when it can run.
+ */
+export function platformPrompt(
+  env: EnvScan,
+  layout: { hasAndroidDir: boolean; hasIosDir: boolean },
+): { choices: Array<{ name: string; message: string; hint?: string }>; initial: number } {
+  const androidHint = env.adbVersion ? undefined : 'ADB not found';
+  if (!env.isMacOS) return { choices: [{ name: 'android', message: 'Android', ...(androidHint ? { hint: androidHint } : {}) }], initial: 0 };
+  const iosHint = !env.xcodeVersion
+    ? 'Xcode not found'
+    : simulatorChoices(env.simulators).length === 0 ? 'no iOS simulators found' : undefined;
+  const choices = [
+    { name: 'android', message: 'Android', ...(androidHint ? { hint: androidHint } : {}) },
+    { name: 'ios', message: 'iOS', ...(iosHint ? { hint: iosHint } : {}) },
+    { name: 'both', message: 'Both' },
+  ];
+  const androidOk = !androidHint;
+  const iosOk = !iosHint;
+  const { hasAndroidDir, hasIosDir } = layout;
+  let pick: 'android' | 'ios' | 'both';
+  if (hasAndroidDir || hasIosDir) {
+    const android = hasAndroidDir && androidOk;
+    const ios = hasIosDir && iosOk;
+    if (android && ios) pick = 'both';
+    else if (android) pick = 'android';
+    else if (ios) pick = 'ios';
+    // Nothing the layout names can run yet: the layout still says what the project is.
+    else pick = hasAndroidDir && hasIosDir ? 'both' : hasIosDir ? 'ios' : 'android';
+  } else {
+    pick = !androidOk && iosOk ? 'ios' : 'android';
+  }
+  return { choices, initial: choices.findIndex((c) => c.name === pick) };
+}
+
 /**
  * The Android questions. `expo` (PILOT-557) swaps the build hint for the Expo
  * one and prefills the package prompt from the app config.
  */
-export async function configureAndroid(env: EnvScan, expo?: ExpoProject): Promise<AndroidConfig> {
+export async function configureAndroid(env: EnvScan, expo?: ExpoProject, cli = 'npx tapsmith'): Promise<AndroidConfig> {
   console.log(`  ${bold('Android')}`);
   if (!env.adbVersion) {
     console.log(`  ${YELLOW}⚠${RESET} ADB not found — Tapsmith cannot reach Android devices or emulators until it is on PATH`);
@@ -334,7 +383,7 @@ export async function configureAndroid(env: EnvScan, expo?: ExpoProject): Promis
       initial,
     });
   } else if (useEmulators) {
-    console.log(`  ${YELLOW}⚠${RESET} ${noAvdsListedMessage(env.avdImages)}`);
+    console.log(`  ${YELLOW}⚠${RESET} ${withTapsmithCommand(noAvdsListedMessage(env.avdImages), cli)}`);
   }
 
   if (deviceType === 'physical' || deviceType === 'both') {
@@ -352,7 +401,7 @@ const SIMULATOR_PICKER_ROWS = 12;
  * The iOS questions. `expo` (PILOT-557) swaps the simulator build hint for
  * the Expo one and is the last fallback for the bundle id prompt's prefill.
  */
-export async function configureIos(env: EnvScan, expo?: ExpoProject): Promise<IosConfig> {
+export async function configureIos(env: EnvScan, expo?: ExpoProject, cli = 'npx tapsmith'): Promise<IosConfig> {
   console.log(`  ${bold('iOS')}`);
 
   // Device type first: a physical-only user has no use for a simulator
@@ -384,8 +433,10 @@ export async function configureIos(env: EnvScan, expo?: ExpoProject): Promise<Io
   }
 
   let simulator: string | undefined;
+  let simulatorDeviceType: string | undefined;
   if (useSimulators) {
-    // Every simulator, a booted one first and selected (PILOT-562).
+    // Every simulator, stock names first, then a booted one, the first
+    // selected (PILOT-562, PILOT-721).
     const choices = simulatorChoices(env.simulators);
     if (choices.length > 0) {
       simulator = await ask<string>({
@@ -396,11 +447,12 @@ export async function configureIos(env: EnvScan, expo?: ExpoProject): Promise<Io
         choices: choices.map((s) => ({
           name: s.name,
           message: s.name,
-          hint: s.state === 'Booted' ? `${s.runtime}, booted` : s.runtime,
+          hint: [s.runtime, ...(s.state === 'Booted' ? ['booted'] : []), ...(isCustomSimulatorName(s) ? ['custom name: this Mac only'] : [])].join(', '),
         })),
         initial: 0,
         limit: SIMULATOR_PICKER_ROWS,
       });
+      simulatorDeviceType = customSimulatorDeviceType(simulator, env);
     } else {
       console.log(`  ${YELLOW}⚠${RESET} No iOS simulators found. Install one via Xcode.`);
       simulator = 'iPhone 17';
@@ -457,7 +509,7 @@ export async function configureIos(env: EnvScan, expo?: ExpoProject): Promise<Io
         console.log(`  ${green('✓')} iOS agent built`);
       } catch (err) {
         console.log(`  ${YELLOW}⚠${RESET} iOS agent build failed: ${err instanceof Error ? err.message : String(err)}`);
-        console.log(dim('  You can run `npx tapsmith ios build-agent` later.'));
+        console.log(dim(`  You can run \`${cli} ios build-agent\` later.`));
       }
     }
 
@@ -499,7 +551,17 @@ export async function configureIos(env: EnvScan, expo?: ExpoProject): Promise<Io
   const bundleId = simBundleId ?? deviceBundleIdRead;
   const deviceBundleId = both && deviceBundleIdRead !== simBundleId ? deviceBundleIdRead : undefined;
 
-  return { appPath, bundleId, deviceBundleId, simulator, usePhysicalDevice, deviceAppPath };
+  return { appPath, bundleId, deviceBundleId, simulator, ...(simulatorDeviceType ? { simulatorDeviceType } : {}), usePhysicalDevice, deviceAppPath };
+}
+
+/**
+ * The device type of the simulator named `name`, when that name is a custom
+ * one only this Mac has (PILOT-721); undefined for a stock name, a UDID or a
+ * name init does not know.
+ */
+export function customSimulatorDeviceType(name: string, env: EnvScan): string | undefined {
+  const sim = simulatorChoices(env.simulators).find((s) => s.name === name);
+  return sim && isCustomSimulatorName(sim) ? sim.deviceTypeName : undefined;
 }
 
 function detectBundleId(appPath: string): string | undefined {
@@ -510,11 +572,34 @@ function detectBundleId(appPath: string): string | undefined {
 
 // ─── Network capture setup ───
 
+/**
+ * The network capture summary line for iOS simulators (PILOT-721): what
+ * still needs doing, judged as `doctor` judges it — mitmproxy's redirector
+ * (`source`, from `mitmproxyRedirectorSource`) and then its Network
+ * Extension. `cli` is how the project runs Tapsmith (`npx tapsmith`).
+ */
+export function iosSimulatorCaptureLine(source: string | undefined, seStatus: SeStatus, cli: string): string {
+  const setup = `\`${cli} ios network setup-simulator\``;
+  if (!source) return `  ${YELLOW}⚠${RESET} iOS simulator — run \`brew install mitmproxy\`, then ${setup}`;
+  switch (seStatus) {
+    case 'enabled':
+      return `  ${green('✓')} iOS simulator — ready (mitmproxy and its Network Extension)`;
+    case 'not-registered':
+      // A fresh machine: nothing to do until the first run, which asks.
+      return `  ${green('✓')} iOS simulator — mitmproxy installed; macOS asks you to allow its Network Extension on your first iOS simulator test run`;
+    case 'waiting-for-user':
+      return `  ${YELLOW}⚠${RESET} iOS simulator — approve mitmproxy's Network Extension: run ${setup}`;
+    default:
+      return `  ${YELLOW}⚠${RESET} iOS simulator — mitmproxy installed, but its Network Extension's state is unclear: run ${setup}`;
+  }
+}
+
 async function setupNetworkCapture(
   platforms: Platform[],
   env: EnvScan,
   androidConfig: AndroidConfig | undefined,
-  iosHasPhysicalDevice: boolean,
+  iosConfig: IosConfig | undefined,
+  cli: string,
 ): Promise<boolean> {
   const { initial, reason } = networkCaptureDefault(platforms, androidConfig, env.avdImages);
   const why = reason ? ` — ${reason}` : '';
@@ -538,22 +623,20 @@ async function setupNetworkCapture(
     }
   }
 
-  if (platforms.includes('ios') && env.isMacOS) {
-    const hasMitmproxy = !!tryExec('brew', ['list', 'mitmproxy']);
-    if (hasMitmproxy) {
-      lines.push(`  ${green('✓')} iOS simulator — mitmproxy ready`);
-    } else {
-      lines.push(`  ${YELLOW}⚠${RESET} iOS simulator — run \`brew install mitmproxy\` then \`npx tapsmith ios network setup-simulator\``);
-    }
+  if (iosConfig?.appPath && env.isMacOS) {
+    // doctor's detection (PILOT-721), and only the step still missing.
+    const { checkSeStatus, mitmproxyRedirectorSource } = await import('./setup-ios.js');
+    const source = mitmproxyRedirectorSource();
+    lines.push(iosSimulatorCaptureLine(source, source ? checkSeStatus() : 'not-registered', cli));
   }
 
-  if (iosHasPhysicalDevice) {
-    lines.push(`  ${YELLOW}⚠${RESET} iOS physical — run \`npx tapsmith ios network configure <udid>\` per device`);
+  if (iosConfig?.usePhysicalDevice) {
+    lines.push(`  ${YELLOW}⚠${RESET} iOS physical — run \`${cli} ios network configure <udid>\` per device`);
   }
 
   if (lines.length > 0) {
     console.log(`\n  ${bold('Network capture')}`);
-    console.log(lines.join('\n'));
+    console.log(withTapsmithCommand(lines.join('\n'), cli));
   }
 
   return true;
@@ -755,6 +838,16 @@ export function generateConfig(
   lines.push('export default defineConfig({');
 
   const esc = (s: string): string => s.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  // A custom simulator name resolves only on this Mac (PILOT-721).
+  const simulatorLines = (indent: string, iosCfg: IosConfig, simulator: string): string[] => [
+    ...(iosCfg.simulatorDeviceType
+      ? [
+        `${indent}// A custom simulator name, only on this Mac: teammates and CI need a simulator`,
+        `${indent}// with this exact name. A stock one such as '${esc(iosCfg.simulatorDeviceType).replace(/[\r\n]+/g, ' ')}' works anywhere it is installed.`,
+      ]
+      : []),
+    `${indent}simulator: '${esc(simulator)}',`,
+  ];
 
   lines.push(...GENERATED_TEST_MATCH_LINES);
   if (enableNetwork) lines.push("  trace: { mode: 'retain-on-failure' },");
@@ -770,7 +863,7 @@ export function generateConfig(
       out.push("        platform: 'ios',");
       if (iosCfg.bundleId) out.push(`        package: '${esc(iosCfg.bundleId)}',`);
       out.push(`        app: '${esc(iosSim.app)}',`);
-      out.push(`        simulator: '${esc(iosSim.simulator)}',`);
+      out.push(...simulatorLines('        ', iosCfg, iosSim.simulator));
       out.push('      },');
       out.push('    },');
     }
@@ -789,7 +882,7 @@ export function generateConfig(
 
   if (platforms.length === 1 && android) {
     if (android.packageName) lines.push(`  package: '${esc(android.packageName)}',`);
-    lines.push(`  apk: '${esc(android.apkPath)}',`);
+    if (android.apkPath) lines.push(`  apk: '${esc(android.apkPath)}',`);
     if (android.useEmulators && android.avd) {
       lines.push(`  avd: '${esc(android.avd)}',`);
     }
@@ -810,7 +903,7 @@ export function generateConfig(
         lines.push(`  app: '${esc(iosDeviceApp)}',`);
       } else if (ios.appPath) {
         lines.push(`  app: '${esc(ios.appPath)}',`);
-        if (ios.simulator) lines.push(`  simulator: '${esc(ios.simulator)}',`);
+        if (ios.simulator) lines.push(...simulatorLines('  ', ios, ios.simulator));
       }
     }
   }
@@ -823,7 +916,7 @@ export function generateConfig(
     lines.push('      use: {');
     lines.push("        platform: 'android',");
     if (android.packageName) lines.push(`        package: '${esc(android.packageName)}',`);
-    lines.push(`        apk: '${esc(android.apkPath)}',`);
+    if (android.apkPath) lines.push(`        apk: '${esc(android.apkPath)}',`);
     if (android.useEmulators && android.avd) {
       lines.push(`        avd: '${esc(android.avd)}',`);
     }
@@ -963,21 +1056,30 @@ export function testsOutsideGeneratedMatchWarning(files: string[]): string | und
  * run before writing tests (PILOT-562). Plain commands: `--json` is for agents.
  */
 export function wizardNextSteps(
+  cli: string,
   installStep: string | undefined,
   captureStep?: { label: string; action: string; optional: boolean },
 ): Array<[string, string]> {
   // A Play-image AVD (PILOT-711): the AVD to switch to — before the first
   // run when capture is on, else last, as an option.
-  const capture = captureStep ? [[captureStep.label, captureStep.action] as [string, string]] : [];
+  const capture = captureStep ? [[captureStep.label, withTapsmithCommand(captureStep.action, cli)] as [string, string]] : [];
   return [
     ...(installStep ? [['Install Tapsmith', installStep] as [string, string]] : []),
     ...(captureStep?.optional ? [] : capture),
-    ['Verify your setup', 'npx tapsmith verify'],
-    ['Run your tests', 'npx tapsmith test'],
-    ['List devices', 'npx tapsmith list-devices'],
-    ['Health check', 'npx tapsmith doctor'],
+    ['Verify your setup', `${cli} verify`],
+    ['Run your tests', `${cli} test`],
+    ['List devices', `${cli} list-devices`],
+    ['Health check', `${cli} doctor`],
     ...(captureStep?.optional ? capture : []),
   ];
+}
+
+/**
+ * `text` with each `npx tapsmith` made `cli`, the project's own way to run
+ * Tapsmith (`tapsmithExecCommand`, PILOT-721), for messages built elsewhere.
+ */
+export function withTapsmithCommand(text: string, cli: string): string {
+  return cli === 'npx tapsmith' ? text : text.replace(/\bnpx tapsmith\b/g, cli);
 }
 
 /** The fix for an unexpected init error: `--json` only for an agent that asked for JSON. */
@@ -1041,7 +1143,7 @@ export async function runInit(opts: InitCommandOptions): Promise<void> {
 
       const cwd = process.cwd();
       const missingTapsmith = isTapsmithResolvableFrom(cwd) ? undefined : await tapsmithInstallCommand(cwd);
-      const result = executeInitPlan(plan, parsed, cwd, missingTapsmith);
+      const result = executeInitPlan(plan, parsed, cwd, missingTapsmith, await tapsmithExecCommand(cwd));
 
       if (parsed.json) {
         process.stdout.write(formatJson(result));
@@ -1102,11 +1204,14 @@ async function runInitInner(): Promise<void> {
 
   // Check for existing config
   const configNames = ['tapsmith.config.ts', 'tapsmith.config.mjs', 'tapsmith.config.js'];
-  const existingConfig = configNames.find((name) => fs.existsSync(path.resolve(process.cwd(), name)));
+  const cwd = process.cwd();
+  // How this project runs Tapsmith, for every command printed (PILOT-721).
+  const cli = await tapsmithExecCommand(cwd);
+  const existingConfig = configNames.find((name) => fs.existsSync(path.resolve(cwd, name)));
   if (existingConfig) {
     const overwrite = await ask<boolean>(confirmQuestion(`Found existing ${existingConfig}. Overwrite it?`, false));
     if (!overwrite) {
-      console.log(dim('  Keeping existing config. Run `npx tapsmith verify` to check your setup.'));
+      console.log(dim(`  Keeping existing config. Run \`${cli} verify\` to check your setup.`));
       return;
     }
   }
@@ -1121,19 +1226,16 @@ async function runInitInner(): Promise<void> {
   const expo = detectExpoProject(process.cwd());
   displayEnvironment(env, expo);
 
-  // Step 2: Platform selection
-  const platformChoices: Array<{ name: string; message: string; hint?: string }> = [
-    { name: 'android', message: 'Android' },
-  ];
-  if (env.isMacOS) {
-    platformChoices.push({ name: 'ios', message: 'iOS' });
-    platformChoices.push({ name: 'both', message: 'Both' });
-  }
-
+  // Step 2: Platform selection, defaulting to one that can run (PILOT-721)
+  const platforms = platformPrompt(env, {
+    hasAndroidDir: fs.existsSync(path.join(cwd, 'android')),
+    hasIosDir: fs.existsSync(path.join(cwd, 'ios')),
+  });
   const platformChoice = await ask<string>({
     type: 'select',
     message: 'Which platform(s) will you test?',
-    choices: platformChoices,
+    choices: platforms.choices,
+    initial: platforms.initial,
   });
 
   const selectedPlatforms: Platform[] = platformChoice === 'both'
@@ -1145,15 +1247,14 @@ async function runInitInner(): Promise<void> {
   let iosConfig: IosConfig | undefined;
 
   if (selectedPlatforms.includes('android')) {
-    androidConfig = await configureAndroid(env, expo);
+    androidConfig = await configureAndroid(env, expo, cli);
   }
   if (selectedPlatforms.includes('ios')) {
-    iosConfig = await configureIos(env, expo);
+    iosConfig = await configureIos(env, expo, cli);
   }
 
   // Step 5: Network capture
-  const iosHasPhysicalDevice = iosConfig?.usePhysicalDevice ?? false;
-  const enableNetwork = await setupNetworkCapture(selectedPlatforms, env, androidConfig, iosHasPhysicalDevice);
+  const enableNetwork = await setupNetworkCapture(selectedPlatforms, env, androidConfig, iosConfig, cli);
 
   // Step 6: iOS simulator agent check
   if (needsSimulatorAgent(iosConfig)) {
@@ -1219,13 +1320,13 @@ async function runInitInner(): Promise<void> {
   console.log(`  ${bold('Next steps')}`);
   const projects = generatedProjects(selectedPlatforms, iosConfig);
   const captureStep = androidConfig?.useEmulators ? captureAvdNextStep(androidConfig.avd, env.avdImages, enableNetwork) : undefined;
-  const steps = wizardNextSteps(installStep, captureStep);
+  const steps = wizardNextSteps(cli, installStep, captureStep);
   const width = Math.max(...[...steps.map(([l]) => l), ...projects.map((p) => p.label)].map((l) => l.length)) + 3;
   const step = (label: string, cmd: string): void => console.log(`  ${`${label}:`.padEnd(width)}${green(cmd)}`);
   for (const [label, cmd] of steps) step(label, cmd);
   if (projects.length > 0) {
     console.log();
-    for (const { name, label } of projects) step(label, `npx tapsmith test --project ${name}`);
+    for (const { name, label } of projects) step(label, `${cli} test --project ${name}`);
   }
 
   console.log();

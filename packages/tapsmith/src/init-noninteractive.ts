@@ -8,10 +8,10 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { simulatorChoices, type EnvScan } from './env-scan.js';
 import type { AndroidConfig, IosConfig, Platform } from './init.js';
-import { EXAMPLE_TEST_PATH, generateConfig, tapsmithTestsOutsideGeneratedMatch, testsOutsideGeneratedMatchWarning, writeExampleTest } from './init.js';
+import { EXAMPLE_TEST_PATH, customSimulatorDeviceType, generateConfig, withTapsmithCommand, tapsmithTestsOutsideGeneratedMatch, testsOutsideGeneratedMatchWarning, writeExampleTest } from './init.js';
 import { writeAgentsMd } from './agents-md.js';
 import { ignoreTestResultsOrWarn } from './init-gitignore.js';
-import { avdCaptureSupport, avdCaptureWarning, captureAvdNextStep, noAvdsListedMessage } from './avd-images.js';
+import { avdCaptureWarning, captureAvdNextStep, noAvdsListedMessage, preferredAvd } from './avd-images.js';
 import * as detectDefaults from './init-detect.js';
 import type { InitCommandOptions } from './cli-program.js';
 import type { InstallCommand } from './config.js';
@@ -145,12 +145,19 @@ export function resolveInitPlan(
   // project layout. A given build names its platform (PILOT-626) — an Expo
   // managed project has no android/ or ios/ — and adds to, rather than
   // replaces, what the directories imply, so `--apk` alone in a project with
-  // both never drops iOS. `--app` off macOS is an explicit iOS ask, refused below.
+  // both never drops iOS. `--package`, an Android package (installed already
+  // when there is no APK, PILOT-721), names Android too, unless something
+  // points at iOS (`--app`, an ios/ directory): the config's `package` key
+  // also holds the iOS bundle id, so it may be meant as one. Beside
+  // `--bundle-id` it can only be the Android package. `--app` off macOS is
+  // an explicit iOS ask, refused below.
   let platforms = args.platforms;
   if (!platforms) {
     const inferred: Platform[] = [];
-    if (args.apk || fs.existsSync(path.join(cwd, 'android'))) inferred.push('android');
-    if (args.app || (env.isMacOS && fs.existsSync(path.join(cwd, 'ios')))) inferred.push('ios');
+    const iosDir = env.isMacOS && fs.existsSync(path.join(cwd, 'ios'));
+    const packageNamesAndroid = !!args.packageName && (!!args.bundleId || (!args.app && !iosDir));
+    if (args.apk || packageNamesAndroid || fs.existsSync(path.join(cwd, 'android'))) inferred.push('android');
+    if (args.app || iosDir) inferred.push('ios');
     if (inferred.length === 0) {
       const expoProject = expo();
       if (expoProject) {
@@ -170,8 +177,19 @@ export function resolveInitPlan(
       // The note needs only whether this is Expo, not the app config's ids,
       // so the config is not read: that would run the project's Expo CLI.
       const detectExpo = detect.detectExpoProject ?? detectDefaults.detectExpoProject;
-      warnings.push(iosLeftOutNote(detectExpo(cwd, () => undefined), args.apk));
+      // Once ios/ exists, --package alone no longer names Android, so a
+      // re-run it configured must name both platforms.
+      const packageOnly = packageNamesAndroid && !args.apk && !fs.existsSync(path.join(cwd, 'android'));
+      warnings.push(iosLeftOutNote(detectExpo(cwd, () => undefined), args.apk, packageOnly));
     }
+  }
+
+  if (args.packageName && !platforms.includes('android')) {
+    const forIos = args.bundleId ? '' : ` For the iOS bundle identifier, pass --bundle-id ${args.packageName}`;
+    warnings.push(`--package names an Android package, so ${args.packageName} was not used: this setup has no Android.${forIos}`);
+  }
+  if (args.bundleId && !platforms.includes('ios')) {
+    warnings.push(`--bundle-id names an iOS bundle identifier, so ${args.bundleId} was not used: this setup has no iOS`);
   }
 
   if (platforms.includes('ios') && !env.isMacOS) {
@@ -186,15 +204,16 @@ export function resolveInitPlan(
     if (!apkPath) {
       const prefer = detect.preferDebugApk ?? detectDefaults.preferDebugApk;
       const candidates = prefer(detect.findApkCandidates(cwd));
-      if (candidates.length === 0) {
+      if (candidates.length === 0 && !args.packageName) {
+        const installed = 'or --package <id> if the app is already installed on the device (a dev client, say)';
         const expoProject = expo();
         if (expoProject) {
           throw new InitError('NO_APK', 'No Android APK found under android/**/build/outputs/apk/', {
-            fix: detectDefaults.expoBuildHint(['android'], expoProject, 'Or pass --apk <path>.'),
+            fix: detectDefaults.expoBuildHint(['android'], expoProject, `Or pass --apk <path>, ${installed}.`),
           });
         }
         throw new InitError('NO_APK', 'No Android APK found under android/**/build/outputs/apk/', {
-          fix: 'Build your app (e.g. cd android && ./gradlew assembleDebug; a React Native Debug build also needs Metro running, see https://tapsmith.dev/getting-started/#build-the-app-under-test), or pass --apk <path>',
+          fix: `Build your app (e.g. cd android && ./gradlew assembleDebug; a React Native Debug build also needs Metro running, see https://tapsmith.dev/getting-started/#build-the-app-under-test), or pass --apk <path>, ${installed}`,
         });
       }
       if (candidates.length > 1) {
@@ -206,32 +225,37 @@ export function resolveInitPlan(
       apkPath = candidates[0];
     }
 
-    const apkAbs = path.resolve(cwd, apkPath);
-    let packageName = args.packageName ?? detect.detectAndroidPackage(apkAbs);
-    // The app config's id stands in only for a build that exists: a missing
-    // APK still fails here, and a stand-in is said, since a build variant
-    // (applicationIdSuffix) can carry another id (PILOT-557).
-    const configPackage = !packageName && fs.existsSync(apkAbs) ? expo()?.androidPackage : undefined;
-    if (configPackage) {
-      packageName = configPackage;
-      warnings.push(`Could not read the package name from ${apkPath} (needs aapt2 from the Android SDK build-tools), so used ${configPackage} from the Expo app config — check it matches this build, or pass --package <id>`);
-    }
-    if (!packageName) {
-      throw new InitError('NO_PACKAGE', `Could not detect package name from ${apkPath} (aapt2 unavailable or APK missing)`, {
-        fix: 'Pass --package <id>',
-      });
+    let packageName = args.packageName;
+    if (apkPath === undefined) {
+      // `package` alone is a valid config (PILOT-721): Tapsmith launches and
+      // resets an app that is already installed, it just cannot install it.
+      warnings.push(`No APK found, so the config has no apk: Tapsmith will launch and reset ${packageName} but cannot install it — install the app on the device yourself, or add apk: '<path>' to tapsmith.config.ts`);
+    } else {
+      const apkAbs = path.resolve(cwd, apkPath);
+      packageName ??= detect.detectAndroidPackage(apkAbs);
+      // The app config's id stands in only for a build that exists: a missing
+      // APK still fails here, and a stand-in is said, since a build variant
+      // (applicationIdSuffix) can carry another id (PILOT-557).
+      const configPackage = !packageName && fs.existsSync(apkAbs) ? expo()?.androidPackage : undefined;
+      if (configPackage) {
+        packageName = configPackage;
+        warnings.push(`Could not read the package name from ${apkPath} (needs aapt2 from the Android SDK build-tools), so used ${configPackage} from the Expo app config — check it matches this build, or pass --package <id>`);
+      }
+      if (!packageName) {
+        throw new InitError('NO_PACKAGE', `Could not detect package name from ${apkPath} (aapt2 unavailable or APK missing)`, {
+          fix: 'Pass --package <id>',
+        });
+      }
     }
 
     const deviceType = args.deviceType ?? 'emulator';
     const useEmulators = deviceType === 'emulator' || deviceType === 'both';
     let avd = args.avd;
     if (useEmulators && !avd) {
-      // With capture on, skip past Play-image AVDs (Android Studio's default,
-      // usually listed first): HTTPS is never captured on them (PILOT-403).
-      const capable = args.networkCapture
-        ? env.avds.find((name) => avdCaptureSupport(env.avdImages.find((a) => a.name === name)) === 'capable')
-        : undefined;
-      avd = capable ?? env.avds[0];
+      // Skip past Play-image AVDs (Android Studio's default, usually listed
+      // first), capture on or off: HTTPS is never captured or routed on them
+      // (PILOT-403, PILOT-721).
+      avd = preferredAvd(env.avds, env.avdImages);
     }
     // Nothing listed: either there are no AVDs, or `emulator` (which Tapsmith
     // launches AVDs with) was not found — the latter matters for an explicit
@@ -302,7 +326,11 @@ export function resolveInitPlan(
         warnings.push('No iOS simulators found — install one via Xcode; defaulting to "iPhone 17"');
       }
     }
-    ios = { appPath, bundleId, simulator, usePhysicalDevice: false };
+    const simulatorDeviceType = customSimulatorDeviceType(simulator, env);
+    if (simulatorDeviceType) {
+      warnings.push(`Simulator '${simulator}' is a custom name on this Mac, so the config resolves only here: teammates and CI need a simulator with that exact name. For one that works anywhere it is installed, pass --simulator '${simulatorDeviceType}'`);
+    }
+    ios = { appPath, bundleId, simulator, ...(simulatorDeviceType ? { simulatorDeviceType } : {}), usePhysicalDevice: false };
   }
 
   const captureAvdStep = android?.useEmulators ? captureAvdNextStep(android.avd, env.avdImages, args.networkCapture) : undefined;
@@ -315,10 +343,11 @@ export function resolveInitPlan(
  * without one, a project whose APK is not under android/ would come back
  * iOS-only, its Android setup deleted by --force.
  */
-function iosLeftOutNote(expoProject: detectDefaults.ExpoProject | undefined, apk: string | undefined): string {
+function iosLeftOutNote(expoProject: detectDefaults.ExpoProject | undefined, apk: string | undefined, packageOnly = false): string {
   const reason = 'iOS left out of the config: this project has no ios/ directory yet, so there is no iOS app to test.';
   const apkFlag = apk ? ` --apk ${/^[\w./@:+=-]+$/.test(apk) ? apk : `'${apk.replace(/'/g, `'\\''`)}'`}` : '';
-  const rerun = `Then re-run \`npx tapsmith init --force${apkFlag}\` with any other flags you passed this time, adding \`--app <path>\` if the iOS build is outside ios/.`;
+  const platformFlag = packageOnly ? ' --platform android,ios' : '';
+  const rerun = `Then re-run \`npx tapsmith init --force${platformFlag}${apkFlag}\` with any other flags you passed this time, adding \`--app <path>\` if the iOS build is outside ios/.`;
   if (expoProject) return `${reason} To test iOS too: ${detectDefaults.expoBuildHint(['ios'], expoProject, rerun)}`;
   return `${reason} To test iOS too, generate the iOS project and build the app for the simulator. ${rerun}`;
 }
@@ -528,6 +557,7 @@ export function executeInitPlan(
   args: InitArgs,
   cwd: string = process.cwd(),
   missingTapsmith?: InstallCommand,
+  cli = 'npx tapsmith',
 ): InitResult {
   const filesCreated: string[] = [];
   const warnings = [...plan.warnings];
@@ -569,5 +599,7 @@ export function executeInitPlan(
     ...(captureStep?.optional ? [`${captureStep.label}: ${captureStep.action}`] : []),
   ];
 
-  return { configPath, filesCreated, warnings, nextSteps };
+  // In the project's own runner (`pnpm exec tapsmith`, PILOT-721).
+  const local = (text: string): string => withTapsmithCommand(text, cli);
+  return { configPath, filesCreated, warnings: warnings.map(local), nextSteps: nextSteps.map(local) };
 }

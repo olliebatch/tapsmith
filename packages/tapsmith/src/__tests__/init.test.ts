@@ -2,7 +2,8 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { EXAMPLE_TEST_PATH, GENERATED_TEST_MATCH, androidEmulatorCaptureLine, avdPickerChoices, normalizeTypedPath, typedBuildPath, validateBuildPath, generateConfig, generatedProjects, generateExampleTest, networkCaptureDefault, runInit, wizardNextSteps } from '../init.js';
+import { EXAMPLE_TEST_PATH, GENERATED_TEST_MATCH, androidEmulatorCaptureLine, avdPickerChoices, normalizeTypedPath, typedBuildPath, validateBuildPath, generateConfig, generatedProjects, generateExampleTest, iosSimulatorCaptureLine, networkCaptureDefault, platformPrompt, runInit, wizardNextSteps } from '../init.js';
+import type { EnvScan } from '../env-scan.js';
 import type { AndroidConfig, IosConfig, Platform } from '../init.js';
 import { platformlessIosFields } from '../doctor.js';
 import { _internal } from '../runner.js';
@@ -311,6 +312,30 @@ const studioAvds: AvdImageInfo[] = [
   { name: 'Tapsmith_Phone_API_36', tagId: 'google_apis', apiLevel: 36 },
 ];
 
+describe('generateConfig() with a custom-named simulator (PILOT-721)', () => {
+  const ios: IosConfig = { appPath: 'ios/App.app', bundleId: 'com.example', simulator: "Sam's iPhone", simulatorDeviceType: 'iPhone 17', usePhysicalDevice: false };
+
+  it('comments that the name is machine-local, naming a stock alternative', () => {
+    const text = generateConfig(['ios'], undefined, ios, false);
+    const lines = text.split('\n');
+    const at = lines.findIndex((l) => l.includes("simulator: 'Sam\\'s iPhone'"));
+    expect(at).toBeGreaterThan(0);
+    expect(lines.slice(at - 2, at).join(' ')).toMatch(/only on this Mac.*'iPhone 17'/);
+    expect(evaluateConfig(text).simulator).toBe("Sam's iPhone");
+  });
+
+  it('comments it inside the ios project of a multi-platform config too', () => {
+    const android: AndroidConfig = { apkPath: 'a.apk', packageName: 'com.a', useEmulators: true, usePhysicalDevices: false, avd: 'X' };
+    const text = generateConfig(['android', 'ios'], android, ios, false);
+    expect(text).toMatch(/only on this Mac[\s\S]*simulator: 'Sam\\'s iPhone'/);
+    expect(evaluateConfig(text).projects?.find((p) => p.name === 'ios')?.use?.simulator).toBe("Sam's iPhone");
+  });
+
+  it('adds no comment for a stock name', () => {
+    expect(generateConfig(['ios'], undefined, { ...ios, simulator: 'iPhone 17', simulatorDeviceType: undefined }, false)).not.toContain('only on this Mac');
+  });
+});
+
 describe('avdPickerChoices()', () => {
   it('marks Play images and pre-selects the first capture-capable AVD, keeping list order', () => {
     const { choices, initial } = avdPickerChoices(['Medium_Phone_API_36', 'Tapsmith_Phone_API_36'], studioAvds);
@@ -330,6 +355,64 @@ describe('avdPickerChoices()', () => {
     const { choices, initial } = avdPickerChoices(['Mystery'], [{ name: 'Mystery' }]);
     expect(choices[0].hint).toBeUndefined();
     expect(initial).toBe(0);
+  });
+
+  it('pre-selects an AVD whose image could not be read over an earlier Play image (PILOT-721)', () => {
+    const { initial } = avdPickerChoices(['Medium_Phone_API_36', 'Mystery'], [...studioAvds, { name: 'Mystery' }]);
+    expect(initial).toBe(1);
+  });
+});
+
+// ─── Platform prompt (PILOT-721) ───
+
+describe('platformPrompt() (PILOT-721)', () => {
+  const env = (over: Partial<EnvScan> = {}): EnvScan => ({
+    nodeVersion: '22.0.0', rosettaWarning: undefined, daemonBin: '/bin/tapsmith-core', agentApk: true, agentTestApk: true,
+    adbVersion: '35.0.1', androidHome: '/sdk', xcodeVersion: '26.0',
+    simulators: [{ name: 'iPhone 17', udid: 'A', state: 'Shutdown', runtime: 'iOS 26.0' }],
+    avds: [], avdImages: [], isMacOS: true, ...over,
+  });
+  const none = { hasAndroidDir: false, hasIosDir: false };
+  const selected = (p: ReturnType<typeof platformPrompt>): string => p.choices[p.initial].name;
+
+  it('defaults to iOS when adb is missing and Xcode is ready, hinting why Android is not', () => {
+    const p = platformPrompt(env({ adbVersion: undefined }), none);
+    expect(selected(p)).toBe('ios');
+    expect(p.choices.find((c) => c.name === 'android')?.hint).toBe('ADB not found');
+  });
+
+  it('defaults to iOS in a project with only ios/', () => {
+    expect(selected(platformPrompt(env(), { hasAndroidDir: false, hasIosDir: true }))).toBe('ios');
+  });
+
+  it('defaults to Android in a project with only android/', () => {
+    expect(selected(platformPrompt(env(), { hasAndroidDir: true, hasIosDir: false }))).toBe('android');
+  });
+
+  it('defaults to both when the project has android/ and ios/ and both toolchains are ready', () => {
+    expect(selected(platformPrompt(env(), { hasAndroidDir: true, hasIosDir: true }))).toBe('both');
+  });
+
+  it('defaults to the usable one of a two-platform project', () => {
+    expect(selected(platformPrompt(env({ adbVersion: undefined }), { hasAndroidDir: true, hasIosDir: true }))).toBe('ios');
+    expect(selected(platformPrompt(env({ xcodeVersion: undefined }), { hasAndroidDir: true, hasIosDir: true }))).toBe('android');
+  });
+
+  it('keeps Android first when both toolchains are ready and the layout says nothing', () => {
+    const p = platformPrompt(env(), none);
+    expect(selected(p)).toBe('android');
+    expect(p.choices.every((c) => c.hint === undefined)).toBe(true);
+  });
+
+  it('hints an iOS without Xcode, and an iOS with no simulators', () => {
+    expect(platformPrompt(env({ xcodeVersion: undefined }), none).choices.find((c) => c.name === 'ios')?.hint).toBe('Xcode not found');
+    expect(platformPrompt(env({ simulators: [] }), none).choices.find((c) => c.name === 'ios')?.hint).toBe('no iOS simulators found');
+  });
+
+  it('offers only Android off macOS', () => {
+    const p = platformPrompt(env({ isMacOS: false, xcodeVersion: undefined, simulators: [], adbVersion: undefined }), { hasAndroidDir: false, hasIosDir: true });
+    expect(p.choices.map((c) => c.name)).toEqual(['android']);
+    expect(p.initial).toBe(0);
   });
 });
 
@@ -367,6 +450,31 @@ describe('androidEmulatorCaptureLine()', () => {
     const lines = stripAnsi(androidEmulatorCaptureLine('Medium_Phone_API_36', studioAvds, false)).split('\n');
     expect(lines[0]).toMatch(/ADB not found/);
     expect(lines[1]).toMatch(/^ {2}⚠ Android emulator — AVD Medium_Phone_API_36 uses a Google Play system image/);
+  });
+});
+
+describe('iosSimulatorCaptureLine() (PILOT-721)', () => {
+  const line = (...args: Parameters<typeof iosSimulatorCaptureLine>): string => stripAnsi(iosSimulatorCaptureLine(...args));
+
+  it('asks for mitmproxy only when doctor would not find it', () => {
+    expect(line(undefined, 'not-registered', 'npx tapsmith')).toBe('  ⚠ iOS simulator — run `brew install mitmproxy`, then `npx tapsmith ios network setup-simulator`');
+    expect(line('/Applications', 'not-registered', 'npx tapsmith')).not.toContain('brew install');
+  });
+
+  it('says it is ready when mitmproxy and its Network Extension are', () => {
+    expect(line('/Applications', 'enabled', 'npx tapsmith')).toBe('  ✓ iOS simulator — ready (mitmproxy and its Network Extension)');
+  });
+
+  it('on a fresh machine, says the extension asks for approval on the first run, with nothing to run now', () => {
+    const l = line('Homebrew cask', 'not-registered', 'npx tapsmith');
+    expect(l).toMatch(/^ {2}✓ iOS simulator — mitmproxy installed/);
+    expect(l).toContain('first iOS simulator test run');
+    expect(l).not.toContain('setup-simulator');
+  });
+
+  it('points at setup-simulator only for an extension waiting for approval or in an unknown state, in the project\'s runner', () => {
+    expect(line('/Applications', 'waiting-for-user', 'pnpm exec tapsmith')).toBe('  ⚠ iOS simulator — approve mitmproxy\'s Network Extension: run `pnpm exec tapsmith ios network setup-simulator`');
+    expect(line('/Applications', 'unknown', 'npx tapsmith')).toContain('`npx tapsmith ios network setup-simulator`');
   });
 });
 
@@ -641,26 +749,38 @@ describe.skipIf(process.platform === 'win32' || process.getuid?.() === 0)('runIn
 
 describe('wizardNextSteps() (PILOT-562)', () => {
   it('leads with `tapsmith verify`, as getting-started does, and never shows a person --json', () => {
-    const steps = wizardNextSteps(undefined);
+    const steps = wizardNextSteps('npx tapsmith', undefined);
     expect(steps[0]).toEqual(['Verify your setup', 'npx tapsmith verify']);
     expect(steps.map(([, cmd]) => cmd)).toEqual(['npx tapsmith verify', 'npx tapsmith test', 'npx tapsmith list-devices', 'npx tapsmith doctor']);
   });
 
   it('puts a declined install first (PILOT-551)', () => {
-    const steps = wizardNextSteps('npm i -D tapsmith');
+    const steps = wizardNextSteps('npx tapsmith', 'npm i -D tapsmith');
     expect(steps[0]).toEqual(['Install Tapsmith', 'npm i -D tapsmith']);
     expect(steps[1][1]).toBe('npx tapsmith verify');
   });
 
   it('points a Play-image AVD at HTTPS-capable one before verify when capture is on (PILOT-711)', () => {
-    const steps = wizardNextSteps('npm i -D tapsmith', { label: 'Capture HTTPS', action: 'npx tapsmith create-avd', optional: false });
+    const steps = wizardNextSteps('npx tapsmith', 'npm i -D tapsmith', { label: 'Capture HTTPS', action: 'npx tapsmith create-avd', optional: false });
     expect(steps[0][0]).toBe('Install Tapsmith');
     expect(steps[1]).toEqual(['Capture HTTPS', 'npx tapsmith create-avd']);
     expect(steps[2][1]).toBe('npx tapsmith verify');
   });
 
+  it('names the project\'s own runner, in the capture step too (PILOT-721)', () => {
+    const steps = wizardNextSteps('pnpm exec tapsmith', 'pnpm add -D tapsmith', { label: 'Capture HTTPS', action: 'npx tapsmith create-avd, then change avd', optional: false });
+    expect(steps.map(([, cmd]) => cmd)).toEqual([
+      'pnpm add -D tapsmith',
+      'pnpm exec tapsmith create-avd, then change avd',
+      'pnpm exec tapsmith verify',
+      'pnpm exec tapsmith test',
+      'pnpm exec tapsmith list-devices',
+      'pnpm exec tapsmith doctor',
+    ]);
+  });
+
   it('lists it last, as an option, when capture is off', () => {
-    const steps = wizardNextSteps(undefined, { label: 'Optional, to capture HTTPS', action: 'npx tapsmith create-avd', optional: true });
+    const steps = wizardNextSteps('npx tapsmith', undefined, { label: 'Optional, to capture HTTPS', action: 'npx tapsmith create-avd', optional: true });
     expect(steps[0][1]).toBe('npx tapsmith verify');
     expect(steps[steps.length - 1]).toEqual(['Optional, to capture HTTPS', 'npx tapsmith create-avd']);
   });

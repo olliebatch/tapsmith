@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import { initArgsFromOptions, resolveInitPlan, executeInitPlan, assertConfigWritable, assertProjectWritable, InitError, type DetectFns } from '../init-noninteractive.js';
 import type { ExpoProject } from '../init-detect.js';
-import { needsSimulatorAgent } from '../init.js';
+import { generateConfig, needsSimulatorAgent } from '../init.js';
 import { simulatorChoices, type EnvScan } from '../env-scan.js';
 import type { InitCommandOptions } from '../cli-program.js';
 
@@ -169,12 +169,79 @@ describe('resolveInitPlan()', () => {
     expect(err.fix).toContain('--apk');
   });
 
-  it('errors NO_APK when nothing found', () => {
+  it('errors NO_APK when nothing found, offering --package for an installed app (PILOT-721)', () => {
     const detect = { ...detectStubs, findApkCandidates: () => [] };
-    expectInitError(
+    const err = expectInitError(
       () => resolveInitPlan(initArgs({ yes: true, platform: 'android' }), baseEnv, detect),
       'NO_APK',
     );
+    expect(err.fix).toContain('--apk <path>');
+    expect(err.fix).toContain('--package <id>');
+  });
+
+  it('with --package and no APK, plans a package-only config and says the app must be installed (PILOT-721)', () => {
+    const detect = { ...detectStubs, findApkCandidates: () => [] };
+    const plan = resolveInitPlan(initArgs({ yes: true, platform: 'android', package: 'com.x' }), baseEnv, detect);
+    expect(plan.android).toMatchObject({ packageName: 'com.x', useEmulators: true });
+    expect(plan.android?.apkPath).toBeUndefined();
+    expect(plan.warnings.join('\n')).toMatch(/No APK found.*com\.x.*install the app on the device/);
+    const config = generateConfig(plan.platforms, plan.android, plan.ios, false);
+    expect(config).toContain("package: 'com.x'");
+    expect(config).not.toContain('apk:');
+  });
+
+  it('takes --package without --platform as Android, as --apk is (PILOT-721)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tapsmith-init-'));
+    try {
+      const detect = { ...detectStubs, findApkCandidates: () => [], detectExpoProject: () => ({ hasAndroidDir: false, hasIosDir: false, usesTapsmithHooks: false } as ExpoProject) };
+      const plan = resolveInitPlan(initArgs({ yes: true, package: 'com.x' }), baseEnv, detect, tmp);
+      expect(plan.platforms).toEqual(['android']);
+      expect(plan.android).toMatchObject({ packageName: 'com.x' });
+      // With android/ too, it is simply the Android package.
+      fs.mkdirSync(path.join(tmp, 'android'));
+      fs.mkdirSync(path.join(tmp, 'ios'));
+      const both = resolveInitPlan(initArgs({ yes: true, package: 'com.x' }), baseEnv, detect, tmp);
+      expect(both.platforms).toEqual(['android', 'ios']);
+      expect(both.android?.packageName).toBe('com.x');
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('does not add Android for a --package meant as an iOS bundle id, and says so (PILOT-721)', () => {
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'tapsmith-init-'));
+    try {
+      fs.mkdirSync(path.join(tmp, 'ios'));
+      const dirOnly = resolveInitPlan(initArgs({ yes: true, package: 'com.foo' }), baseEnv, detectStubs, tmp);
+      expect(dirOnly.platforms).toEqual(['ios']);
+      expect(dirOnly.warnings.join('\n')).toContain('--bundle-id');
+      // Beside --bundle-id, --package can only be the Android package: both platforms.
+      const bothIds = resolveInitPlan(initArgs({ yes: true, package: 'com.a.android', bundleId: 'com.a.ios' }), baseEnv, detectStubs, tmp);
+      expect(bothIds.platforms).toEqual(['android', 'ios']);
+      expect(bothIds.android?.packageName).toBe('com.a.android');
+      expect(bothIds.ios?.bundleId).toBe('com.a.ios');
+      // With no iOS in the plan, an unused --bundle-id is said, not dropped silently.
+      const noIos = resolveInitPlan(initArgs({ yes: true, package: 'com.a.android', bundleId: 'com.a.ios' }), baseEnv, detectStubs, path.join(tmp, 'nowhere'));
+      expect(noIos.platforms).toEqual(['android']);
+      expect(noIos.warnings.join('\n')).toContain('--bundle-id names an iOS bundle identifier, so com.a.ios was not used');
+      // An unused --package with --bundle-id given is not told to pass --bundle-id again.
+      const iosOnly = resolveInitPlan(initArgs({ yes: true, platform: 'ios', package: 'com.x', bundleId: 'com.y' }), baseEnv, detectStubs, tmp);
+      const pkgWarning = iosOnly.warnings.find((w) => w.startsWith('--package names'));
+      expect(pkgWarning).toBeDefined();
+      expect(pkgWarning).not.toContain('pass --bundle-id');
+      const withApp = resolveInitPlan(initArgs({ yes: true, package: 'com.foo', app: 'ios/build/X.app' }), baseEnv, detectStubs, path.join(tmp, 'nowhere'));
+      expect(withApp.platforms).toEqual(['ios']);
+      expect(withApp.warnings.join('\n')).toContain("--package names an Android package");
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('with --package on an Expo project with no build, plans a package-only config too (PILOT-721)', () => {
+    const detect = { ...detectStubs, findApkCandidates: () => [], detectExpoProject: () => ({ hasAndroidDir: false, hasIosDir: false, androidPackage: 'com.expo' } as ExpoProject) };
+    const plan = resolveInitPlan(initArgs({ yes: true, platform: 'android', package: 'com.x' }), baseEnv, detect);
+    expect(plan.android?.packageName).toBe('com.x');
+    expect(plan.android?.apkPath).toBeUndefined();
   });
 
   it('infers platform from project layout when --platform omitted', () => {
@@ -294,6 +361,18 @@ describe('resolveInitPlan()', () => {
       fs.mkdirSync(path.join(tmp, 'ios'));
       const rerun = resolveInitPlan(initArgs({ yes: true, force: true, apk: 'build/app.apk' }), baseEnv, detectStubs, tmp);
       expect(rerun.platforms).toEqual(['android', 'ios']);
+    }, false));
+
+    it('keeps Android in the re-run it gives when --package alone configured it (PILOT-721)', () => withProject({ expo: '54.0.0' }, (tmp) => {
+      const detect = { ...detectStubs, findApkCandidates: () => [], detectExpoProject: () => ({ ...managedExpo, hasAndroidDir: false }) };
+      const plan = resolveInitPlan(initArgs({ yes: true, package: 'com.x' }), baseEnv, detect, tmp);
+      expect(plan.platforms).toEqual(['android']);
+      // Once ios/ exists, --package alone would no longer name Android, so the re-run names both platforms.
+      expect(iosNote(plan.warnings)).toContain('`npx tapsmith init --force --platform android,ios`');
+      fs.mkdirSync(path.join(tmp, 'ios'));
+      const rerun = resolveInitPlan(initArgs({ yes: true, force: true, platform: 'android,ios', package: 'com.x' }), baseEnv, detect, tmp);
+      expect(rerun.platforms).toEqual(['android', 'ios']);
+      expect(rerun.android?.packageName).toBe('com.x');
     }, false));
 
     it('quotes an --apk path the shell would split', () => withProject({ 'react-native': '0.79.0' }, (tmp) => {
@@ -564,10 +643,23 @@ describe('resolveInitPlan() AVD choice with network capture', () => {
     expect(plan.warnings).toEqual([]);
   });
 
-  it('keeps "first available" when capture is off', () => {
+  it('prefers the capture-capable AVD when capture is off too, so route() mocking works later (PILOT-721)', () => {
     const plan = resolveInitPlan(android(), studioEnv, detectStubs);
-    expect(plan.android?.avd).toBe('Medium_Phone_API_36');
+    expect(plan.android?.avd).toBe('Tapsmith_Phone_API_36');
     expect(plan.warnings).toEqual([]);
+    expect(plan.captureAvdStep).toBeUndefined();
+  });
+
+  it('prefers an AVD whose image could not be read over a Play image (PILOT-721)', () => {
+    const env: EnvScan = { ...playOnlyEnv, avds: ['Medium_Phone_API_36', 'Mystery'], avdImages: [...playOnlyEnv.avdImages, { name: 'Mystery' }] };
+    expect(resolveInitPlan(android(), env, detectStubs).android?.avd).toBe('Mystery');
+  });
+
+  it('falls back to a Play image when it is all there is, offering create-avd as an optional step (PILOT-721)', () => {
+    const plan = resolveInitPlan(android(), playOnlyEnv, detectStubs);
+    expect(plan.android?.avd).toBe('Medium_Phone_API_36');
+    expect(plan.captureAvdStep?.optional).toBe(true);
+    expect(plan.captureAvdStep?.action).toContain('npx tapsmith create-avd');
   });
 
   it('warns, suggesting a NEW AVD, when only Play images exist', () => {
@@ -699,6 +791,23 @@ describe('executeInitPlan()', () => {
       expect(result.nextSteps[1]).toContain('tapsmith verify');
       expect(result.warnings).toContain("Tapsmith isn't installed in this project, and the files init wrote import it: run pnpm add -D tapsmith before anything else");
       expect(Object.keys(result)).toEqual(['configPath', 'filesCreated', 'warnings', 'nextSteps']);
+    } finally {
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it('names the project\'s runner in Next steps and warnings, not npx (PILOT-721)', () => {
+    const tmp = makeTmp();
+    try {
+      const args = initArgs({ yes: true, platform: 'android', exampleTest: false, agentsMd: false });
+      const playOnly: EnvScan = { ...baseEnv, avds: ['Medium_Phone_API_36'], avdImages: [{ name: 'Medium_Phone_API_36', tagId: 'google_apis_playstore', apiLevel: 36 }] };
+      const plan = resolveInitPlan({ ...args, networkCapture: true }, playOnly, detectStubs, tmp);
+      const result = executeInitPlan(plan, { ...args, networkCapture: true }, tmp, undefined, 'pnpm exec tapsmith');
+      const text = [...result.nextSteps, ...result.warnings].join('\n');
+      expect(text).toContain('pnpm exec tapsmith verify');
+      expect(text).toContain('pnpm exec tapsmith create-avd');
+      expect(text).toContain('claude mcp add tapsmith-headless -- pnpm exec tapsmith mcp-server');
+      expect(text).not.toContain('npx tapsmith');
     } finally {
       fs.rmSync(tmp, { recursive: true, force: true });
     }
@@ -1159,6 +1268,36 @@ describe('simulatorChoices() (PILOT-562)', () => {
     const plan = resolveInitPlan(initArgs({ yes: true, platform: 'ios' }), { ...baseEnv, simulators: sims }, detectStubs);
     expect(plan.ios?.simulator).toBe('iPhone 17');
     expect(plan.warnings.join('\n')).toContain('No iOS simulators found');
+  });
+
+  it('puts custom-named simulators after stock ones, even a booted one (PILOT-721)', () => {
+    const sims = [
+      { ...sim('PersonaA iPhone', 'iOS 26.5', 'Booted'), deviceTypeName: 'iPhone 17' },
+      { ...sim('iPhone 17', 'iOS 26.5'), deviceTypeName: 'iPhone 17' },
+      { ...sim('iPad Air', 'iOS 26.5'), deviceTypeName: 'iPad Air' },
+    ];
+    expect(simulatorChoices(sims).map((s) => s.name)).toEqual(['iPhone 17', 'iPad Air', 'PersonaA iPhone']);
+    const plan = resolveInitPlan(initArgs({ yes: true, platform: 'ios' }), { ...baseEnv, simulators: sims }, detectStubs);
+    expect(plan.ios?.simulator).toBe('iPhone 17');
+    expect(plan.ios?.simulatorDeviceType).toBeUndefined();
+    expect(plan.warnings).toEqual([]);
+  });
+
+  it('init --yes marks a custom-named simulator as machine-local when it is all there is, or was asked for (PILOT-721)', () => {
+    const persona = { ...sim('PersonaA iPhone', 'iOS 26.5', 'Booted'), deviceTypeName: 'iPhone 17' };
+    const only = resolveInitPlan(initArgs({ yes: true, platform: 'ios' }), { ...baseEnv, simulators: [persona] }, detectStubs);
+    expect(only.ios).toMatchObject({ simulator: 'PersonaA iPhone', simulatorDeviceType: 'iPhone 17' });
+    expect(only.warnings.join('\n')).toContain("Simulator 'PersonaA iPhone' is a custom name on this Mac");
+    expect(only.warnings.join('\n')).toContain('iPhone 17');
+    const asked = resolveInitPlan(
+      initArgs({ yes: true, platform: 'ios', simulator: 'PersonaA iPhone' }),
+      { ...baseEnv, simulators: [persona, { ...sim('iPhone 17', 'iOS 26.5'), deviceTypeName: 'iPhone 17' }] },
+      detectStubs,
+    );
+    expect(asked.ios).toMatchObject({ simulator: 'PersonaA iPhone', simulatorDeviceType: 'iPhone 17' });
+    // A UDID or unknown name is left alone: init cannot judge it.
+    const udid = resolveInitPlan(initArgs({ yes: true, platform: 'ios', simulator: 'SOME-UDID' }), { ...baseEnv, simulators: [persona] }, detectStubs);
+    expect(udid.ios?.simulatorDeviceType).toBeUndefined();
   });
 
   it('init --yes picks the booted simulator over the newest iPhone', () => {
