@@ -49,9 +49,12 @@ import {
   deserializeTestResult,
   deserializeSuiteResult,
   serializeConfig,
+  serializeGrepFilters,
   type SerializedConfig,
   type RunFileUseOptions,
 } from '../worker-protocol.js';
+import { grepFiltersFor, hasGrepFilter, type GrepFilters } from '../test-filter.js';
+import { fileTestsInTree, pruneTreeByGrep } from './grep-tree.js';
 import type {
   ServerMessage,
   ClientMessage,
@@ -1401,6 +1404,26 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
     });
   }
 
+  /**
+   * The config's grep filters for a file run under `projectName`: the root's
+   * (`--grep` included) and the project's. A test they leave out is not part
+   * of the suite — not listed in the tree, not run (PILOT-730).
+   */
+  function grepFor(projectName: string | undefined): GrepFilters {
+    const project = projectName !== undefined ? ctx.projects?.find((p) => p.name === projectName) : undefined;
+    return grepFiltersFor(ctx.config, project);
+  }
+
+  /**
+   * Whether the config's grep is what leaves this run of a file with no test
+   * in the tree: the file was discovered (its tests are known, unlike a file
+   * that failed to load) and a grep applies to its project.
+   */
+  function grepExcludesRun(file: TaggedFile): boolean {
+    const node = discoveredFileNodes.get(file.filePath);
+    return node !== undefined && !isLoadFailureNode(node) && hasGrepFilter(grepFor(file.projectName));
+  }
+
   /** Deep-clone a discovered tree node, prefixing every id so the same file
    * appearing under multiple projects gets independent expansion / status
    * state on the client. A node's `use` is its own declaration only: what
@@ -1425,8 +1448,13 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
       const trees: TestTreeNode[] = [];
       for (const project of ctx.projects) {
         const idPrefix = `project::${project.name}::`;
+        const grep = grepFor(projectLabel(project));
         const projectFiles = project.testFiles
           .map((f) => discoveredFileNodes.get(f))
+          .filter((n): n is TestTreeNode => n != null)
+          // Only the tests the config's grep selects, by this project's own
+          // filters (PILOT-730).
+          .map((n) => pruneTreeByGrep(n, grep))
           .filter((n): n is TestTreeNode => n != null)
           // Deep-clone so each project owns its own nodes (unique ids,
           // independent expansion state, scoped status updates).
@@ -1450,8 +1478,11 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
       testTree = trees;
     } else {
       // No meaningful projects — flat file list
+      const grep = grepFor(undefined);
       testTree = ctx.testFiles
         .map((f) => discoveredFileNodes.get(f))
+        .filter((n): n is TestTreeNode => n != null)
+        .map((n) => pruneTreeByGrep(n, grep))
         .filter((n): n is TestTreeNode => n != null);
     }
   }
@@ -2323,26 +2354,15 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
 
   /** The tests of a file in the tree: under its project, narrowed by its test filter. */
   function treeTestsOf(file: TaggedFile): TestTreeNode[] {
-    const roots = file.projectName
-      ? testTree.filter((n) => n.type === 'project' && n.name === file.projectName).flatMap((n) => n.children ?? [])
-      : testTree;
-    const tests: TestTreeNode[] = [];
-    const walk = (nodes: TestTreeNode[]) => {
-      for (const node of nodes) {
-        if (node.type === 'test') tests.push(node);
-        if (node.children) walk(node.children);
-      }
-    };
-    walk(roots.filter((n) => n.type === 'file' && n.filePath === file.filePath));
-    const filter = file.testFilter?.toLowerCase();
-    const narrowed = filter ? tests.filter((t) => t.fullName.toLowerCase().includes(filter)) : tests;
-    return file.fullNames ? narrowed.filter((t) => file.fullNames!.includes(t.fullName)) : narrowed;
+    return fileTestsInTree(testTree, file);
   }
 
   /**
    * Fail a file no worker can run with `reason`. Each of its tests fails, as
    * Playwright fails every test of a project whose browser cannot launch; a
-   * file with no discovered tests gets one file-level failure.
+   * file with no discovered tests gets one file-level failure. A run the
+   * config's grep selects no test of in this file records nothing: those
+   * tests were never part of it (PILOT-593).
    *
    * @returns how many failures were recorded.
    */
@@ -2352,7 +2372,14 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
     /** The file was partway through on a worker that died: these tests (fullName) already reported and keep their result. */
     reported?: ReadonlySet<string>,
   ): number {
-    const tests = treeTestsOf(file).filter((t) => !reported?.has(t.fullName));
+    const selected = treeTestsOf(file);
+    // Only for a file no worker started: one a worker died running may have
+    // been running a test the tree, possibly stale, does not show.
+    if (reported === undefined && selected.length === 0 && grepExcludesRun(file)) {
+      broadcastFileStatus(file.filePath, 'done', file.projectName);
+      return 0;
+    }
+    const tests = selected.filter((t) => !reported?.has(t.fullName));
     if (tests.length === 0) {
       recordFileFailure(file.filePath, file.projectName, new Error(reason));
     } else {
@@ -2487,6 +2514,10 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
   }> {
     let passed = 0, failed = 0, skipped = 0, duration = 0, anyFailed = false;
     const failedProjectsInDispatch = new Set<string>();
+    // Every file is dispatched, even one the tree says the grep selects
+    // nothing in: the tree can be stale (a helper that names the tests
+    // changed, an import broke since), and the worker applies the grep to
+    // what the file holds now, as `tapsmith test` does (PILOT-730).
 
     // A device target that could not start is tried again first; while it
     // still cannot, its files fail with the reason (PILOT-415).
@@ -2494,9 +2525,12 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
     if (!parallelRunAborted) {
       for (const f of unavailable) {
         const sig = f.projectName ? ctx.bucketByProject?.get(f.projectName) : undefined;
-        failed += failUnservableFile(f, (sig && ctx.unavailableTargets.reason(sig)) || 'Its device target could not start');
-        anyFailed = true;
-        if (f.projectName) failedProjectsInDispatch.add(f.projectName);
+        const n = failUnservableFile(f, (sig && ctx.unavailableTargets.reason(sig)) || 'Its device target could not start');
+        failed += n;
+        if (n > 0) {
+          anyFailed = true;
+          if (f.projectName) failedProjectsInDispatch.add(f.projectName);
+        }
       }
     }
     // Copies: dispatch state (`reported`) must not outlive this dispatch on a caller's entries.
@@ -2511,8 +2545,9 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
       // fail the rest alongside the target's files, so the counts and the
       // tree agree, rather than throwing them away.
       for (const f of fileQueue) {
-        failed += failUnservableFile(f, NO_WORKER_MESSAGE);
-        if (f.projectName) failedProjectsInDispatch.add(f.projectName);
+        const n = failUnservableFile(f, NO_WORKER_MESSAGE);
+        failed += n;
+        if (n > 0 && f.projectName) failedProjectsInDispatch.add(f.projectName);
       }
       broadcast({ type: 'error', message: NO_WORKER_MESSAGE });
       return { passed, failed, skipped, duration, anyFailed: true, failedProjectNames: failedProjectsInDispatch };
@@ -2559,9 +2594,12 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
             // Recorded, not just counted, so the file shows why it failed
             // (PILOT-415) — the same as a drained file below.
             for (const f of fileQueue.splice(0)) {
-              failed += failUnservableFile(f, unservableReason(f), f.reported);
-              anyFailed = true;
-              if (f.projectName) failedProjectsInDispatch.add(f.projectName);
+              const n = failUnservableFile(f, unservableReason(f), f.reported);
+              failed += n;
+              if (n > 0) {
+                anyFailed = true;
+                if (f.projectName) failedProjectsInDispatch.add(f.projectName);
+              }
             }
             broadcast({ type: 'error', message: 'Some test files could not be dispatched to any available worker' });
           } else {
@@ -2632,6 +2670,7 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
           projectName: next.projectName,
           testFilter: next.testFilter,
           fullNames: next.fullNames ? [...next.fullNames] : undefined,
+          grep: serializeGrepFilters(grepFor(next.projectName)),
           preparedFor,
         };
         // A worker can die between exit-event delivery and this dispatch; an
@@ -2727,9 +2766,12 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
           // results and the status board showed nothing — the failure existed
           // only in the number. It carries the reason the worker gave, which
           // is the actual cause (an import error, say) rather than the drain.
-          failed += failUnservableFile(f, `No worker could run this file: ${reason}`, f.reported);
-          anyFailed = true;
-          if (f.projectName) failedProjectsInDispatch.add(f.projectName);
+          const n = failUnservableFile(f, `No worker could run this file: ${reason}`, f.reported);
+          failed += n;
+          if (n > 0) {
+            anyFailed = true;
+            if (f.projectName) failedProjectsInDispatch.add(f.projectName);
+          }
         }
         if (orphaned.length > 0) {
           const names = orphaned.map((f) => path.basename(f.filePath)).join(', ');
