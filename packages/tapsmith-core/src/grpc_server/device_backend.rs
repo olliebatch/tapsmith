@@ -14,6 +14,39 @@ use super::*;
 
 pub(super) type ActionResult = Result<Response<proto::ActionResponse>, Status>;
 
+/// Why a network-capture step ended StartNetworkCapture early.
+pub(super) enum CaptureStop {
+    /// An RPC error.
+    Status(Status),
+    /// A response to return as is, usually "capture unavailable" with the reason.
+    Respond(proto::StartNetworkCaptureResponse),
+}
+
+impl From<Status> for CaptureStop {
+    fn from(status: Status) -> Self {
+        CaptureStop::Status(status)
+    }
+}
+
+impl CaptureStop {
+    pub(super) fn into_response(
+        self,
+    ) -> Result<Response<proto::StartNetworkCaptureResponse>, Status> {
+        match self {
+            CaptureStop::Status(status) => Err(status),
+            CaptureStop::Respond(resp) => Ok(Response::new(resp)),
+        }
+    }
+}
+
+/// How `route_capture_traffic` sent the device's traffic to the proxy.
+pub(super) struct CaptureRoute {
+    pub(super) route: proto::NetworkCaptureRoute,
+    /// The macOS system-proxy fallback's lease, published with the proxy.
+    #[cfg(target_os = "macos")]
+    pub(super) pending_lease: Option<ios::system_proxy::PendingLease>,
+}
+
 /// Whether a permission call grants or revokes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PermissionChange {
@@ -164,6 +197,61 @@ pub(super) trait DeviceBackend: Send + Sync {
     async fn after_agent_connected(&self, serial: &str, target_package: &str);
     /// Extra detail for an agent that failed to connect, appended to the error.
     async fn agent_start_diagnostics(&self, serial: &str) -> String;
+
+    // ─── Network capture ───
+    // Network capture runs these in order. A `CaptureStop` ends StartNetworkCapture early.
+    /// Makes the device trust the MITM CA, or checks that it already does.
+    async fn trust_capture_ca(
+        &self,
+        request_id: String,
+        serial: String,
+        mitm_ca: &Arc<MitmAuthority>,
+        ca_pem_path: &str,
+        warnings: &mut Vec<String>,
+        tunnel_all_tls: &mut Option<String>,
+    ) -> Result<(), CaptureStop>;
+    /// Starts the MITM proxy where this device can reach it.
+    async fn start_capture_proxy(
+        &self,
+        request_id: String,
+        serial: String,
+        mitm_ca: &Arc<MitmAuthority>,
+    ) -> Result<NetworkProxy, CaptureStop>;
+    /// Fails when the device could not reach the proxy that just started.
+    async fn check_capture_reachable(
+        &self,
+        request_id: String,
+        host_port: u16,
+    ) -> Result<(), CaptureStop>;
+    /// Points the device's traffic at the proxy.
+    #[allow(clippy::too_many_arguments)]
+    async fn route_capture_traffic(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::StartNetworkCaptureRequest,
+        proxy: &NetworkProxy,
+        mitm_ca: &Arc<MitmAuthority>,
+        host_port: u16,
+        http_ports: &[u16],
+        warnings: &mut Vec<String>,
+    ) -> Result<CaptureRoute, CaptureStop>;
+    /// Undoes `route_capture_traffic` on the device when capture stops.
+    async fn release_capture_route(
+        &self,
+        serial: &str,
+        reverse_port: Option<u16>,
+        ca_cert_path: Option<String>,
+        used_iptables: bool,
+    );
+    /// Same as `release_capture_route`, at daemon shutdown.
+    async fn release_capture_route_on_shutdown(
+        &self,
+        serial: &str,
+        reverse_port: Option<u16>,
+        ca_cert_path: Option<String>,
+        used_iptables: bool,
+    );
 }
 
 /// The backend for `platform`, borrowing `svc` for the call.

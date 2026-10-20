@@ -1,7 +1,9 @@
 //! iOS device work: `simctl` for simulators plus the XCUITest agent, which is
 //! the only path on physical devices.
 
-use super::device_backend::{ActionResult, DeviceBackend, PermissionChange};
+use super::device_backend::{
+    ActionResult, CaptureRoute, CaptureStop, DeviceBackend, PermissionChange,
+};
 use super::*;
 
 pub(super) struct IosBackend<'a> {
@@ -1395,6 +1397,7 @@ impl DeviceBackend for IosBackend<'_> {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     async fn list_web_views(
         &self,
         request_id: String,
@@ -1549,6 +1552,7 @@ impl DeviceBackend for IosBackend<'_> {
         }
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     async fn prearm_network_tracing(&self, req: &proto::SetDeviceRequest) {
         // For physical iOS with tracing enabled, pre-start the Wi-Fi
         // MITM proxy immediately so any subsequent devicectl install
@@ -1589,6 +1593,7 @@ impl DeviceBackend for IosBackend<'_> {
         Ok(())
     }
 
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     async fn reuse_agent(&self, serial: &str, req: &proto::StartAgentRequest) {
         #[cfg(target_os = "macos")]
         if req.network_tracing_enabled && self.svc.is_active_ios_physical().await {
@@ -1706,5 +1711,408 @@ impl DeviceBackend for IosBackend<'_> {
 
     async fn agent_start_diagnostics(&self, _serial: &str) -> String {
         String::new()
+    }
+
+    async fn trust_capture_ca(
+        &self,
+        request_id: String,
+        serial: String,
+        _mitm_ca: &Arc<MitmAuthority>,
+        ca_pem_path: &str,
+        warnings: &mut Vec<String>,
+        _tunnel_all_tls: &mut Option<String>,
+    ) -> Result<(), CaptureStop> {
+        if !self.svc.is_active_ios_physical().await {
+            // Simulator path — install CA into the simulator's trust store
+            // once per session; it stays trusted for subsequent captures.
+            // Per-UDID set, not a single slot: workers switching between
+            // simulators on a shared daemon would otherwise evict each
+            // other's entry and re-run the slow install on every switch.
+            let already_installed = self
+                .svc
+                .ios_ca_cert_installed
+                .read()
+                .await
+                .contains(serial.as_str());
+            if already_installed {
+                debug!(%serial, "MITM CA already installed on simulator this session");
+            } else {
+                match ios::device::install_ca_cert(&serial, ca_pem_path).await {
+                    Ok(()) => {
+                        self.svc
+                            .ios_ca_cert_installed
+                            .write()
+                            .await
+                            .insert(serial.clone());
+                    }
+                    Err(e) => {
+                        let msg = format!(
+                                "Failed to install CA cert on simulator: {e} — HTTPS traffic will not be captured"
+                            );
+                        error!("{msg}");
+                        warnings.push(msg);
+                    }
+                }
+            }
+        } else {
+            // Physical device path (PILOT-185) — the CA is trusted via the
+            // mobileconfig the user installed on the device, so there's
+            // nothing to install from the host. We just verify the
+            // mobileconfig exists and warn loudly if it's missing, since
+            // without it the device has no route into our proxy and no
+            // trust for our CA.
+            #[cfg(target_os = "macos")]
+            {
+                if !ios::physical_device_proxy::mobileconfig_exists(&serial).await {
+                    return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                        request_id,
+                        success: false,
+                        proxy_port: 0,
+                        error_message: format!(
+                            "No Tapsmith network profile found for device {serial}. \
+                                 Run `tapsmith ios network configure {serial}` first, then \
+                                 install the generated .mobileconfig on the device."
+                        ),
+                        ..Default::default()
+                    }));
+                }
+                // Warn if the host's Wi-Fi IP has drifted from what the
+                // mobileconfig was generated against.
+                if let Ok(Some(meta)) =
+                    ios::physical_device_proxy::read_mobileconfig_meta(&serial).await
+                {
+                    if let Ok(current_ip) = ios::physical_device_proxy::resolve_host_wifi_ip().await
+                    {
+                        if ios::physical_device_proxy::is_mobileconfig_stale(&meta, current_ip)
+                            .await
+                        {
+                            let msg = format!(
+                                    "Host Wi-Fi IP changed since mobileconfig was generated ({} → {}). \
+                                     Run `tapsmith ios network configure {serial} --refresh` and reinstall the profile.",
+                                    meta.host_ip, current_ip
+                                );
+                            warn!("{msg}");
+                            warnings.push(msg);
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                    request_id,
+                    success: false,
+                    proxy_port: 0,
+                    error_message: "Physical iOS network capture requires macOS".to_string(),
+                    ..Default::default()
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    // Each OS uses a different one of these parameters (see the cfg blocks).
+    #[allow(unused_variables)]
+    async fn start_capture_proxy(
+        &self,
+        request_id: String,
+        serial: String,
+        mitm_ca: &Arc<MitmAuthority>,
+    ) -> Result<NetworkProxy, CaptureStop> {
+        // Pick the proxy bind address based on device type. Simulators and
+        // Android both want loopback (they reach the proxy via transparent
+        // redirection or adb reverse). Physical iOS devices need a LAN-
+        // reachable listener on a deterministic per-UDID port so their
+        // installed mobileconfig can route traffic here.
+        Ok(if self.svc.is_active_ios_physical().await {
+            #[cfg(target_os = "macos")]
+            {
+                let port = ios::physical_device_proxy::deterministic_port(&serial);
+                let bind = std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                    port,
+                );
+                NetworkProxy::start_on(Arc::clone(mitm_ca), bind)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("Failed to start proxy on {bind}: {e}"))
+                    })?
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                    request_id,
+                    success: false,
+                    proxy_port: 0,
+                    error_message: "Physical iOS network capture requires macOS".to_string(),
+                    ..Default::default()
+                }));
+            }
+        } else {
+            NetworkProxy::start(Arc::clone(mitm_ca))
+                .await
+                .map_err(|e| Status::internal(format!("Failed to start proxy: {e}")))?
+        })
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    async fn check_capture_reachable(
+        &self,
+        request_id: String,
+        host_port: u16,
+    ) -> Result<(), CaptureStop> {
+        // Physical iOS: verify the proxy is reachable from the LAN. On
+        // modern macOS the Application Firewall's stealth mode silently
+        // drops inbound TCP SYNs to user processes, even when the binary
+        // is explicitly allowed in the firewall list. The symptom is the
+        // device never reaches the proxy — traffic capture silently
+        // returns 0 entries and users spend an hour debugging SSID /
+        // profile install / Wi-Fi before finding the real cause.
+        //
+        // Check by connecting to our own LAN IP on the proxy port. If
+        // that times out, the firewall (or similar) is blocking and we
+        // return a clear error with the exact socketfilterfw fix.
+        #[cfg(target_os = "macos")]
+        if self.svc.is_active_ios_physical().await {
+            if let Ok(lan_ip) = ios::physical_device_proxy::resolve_host_wifi_ip().await {
+                let reachable = self_probe_lan_listener(lan_ip, host_port).await;
+                if !reachable {
+                    // The caller drops the proxy on this error — otherwise the
+                    // next start_network_capture call will fail with "already running".
+                    return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                        request_id,
+                        success: false,
+                        proxy_port: 0,
+                        error_message: format!(
+                            "Tapsmith proxy is bound to {lan_ip}:{host_port} but inbound LAN \
+                             connections are being blocked — the iPhone will never reach it.\n\n\
+                             Most likely cause: macOS Application Firewall stealth mode is \
+                             silently dropping unsolicited inbound TCP SYNs, even for \
+                             allow-listed binaries. Disable it with:\n  \
+                             sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode off\n\n\
+                             Or disable the firewall entirely for this session:\n  \
+                             sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off"
+                        ),
+                        ..Default::default()
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+    async fn route_capture_traffic(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::StartNetworkCaptureRequest,
+        proxy: &NetworkProxy,
+        mitm_ca: &Arc<MitmAuthority>,
+        host_port: u16,
+        _http_ports: &[u16],
+        warnings: &mut Vec<String>,
+    ) -> Result<CaptureRoute, CaptureStop> {
+        let route: proto::NetworkCaptureRoute;
+        #[cfg(target_os = "macos")]
+        let mut pending_lease: Option<ios::system_proxy::PendingLease> = None;
+        if !self.svc.is_active_ios_physical().await {
+            // PILOT-182: route the simulator's traffic into the MITM
+            // proxy via the macOS Network Extension redirector instead
+            // of a global system proxy. Per-PID filtering gives each
+            // worker daemon full isolation from other concurrent
+            // workers (and from the user's host traffic).
+            //
+            // If the redirector fails to start (SE not approved, brew
+            // missing, launcher binary unreachable, …), there is NO
+            // path for traffic to reach the proxy — capture is
+            // effectively dead. Early-return `success: false` so the
+            // runner prints "Network capture disabled" instead of the
+            // misleading "warning". The local `proxy` is dropped at
+            // end of scope, releasing the TCP listener.
+            #[cfg(target_os = "macos")]
+            {
+                // The system-proxy fallback is host-wide: it records every
+                // process on the Mac (browsers, trustd, other simulators)
+                // and nothing in the captured entries says which. It is
+                // refused when the caller needs per-device attribution (the
+                // runner, for a multi-device group) and, unless opted in,
+                // outside CI — a developer Mac has the Network Extension, so
+                // falling back there hides a real failure behind a capture
+                // of the developer's own browsing (PILOT-319).
+                let decision = ios::system_proxy::fallback_decision(
+                    req.require_isolation,
+                    ios::system_proxy::fallback_allowed_from_env(),
+                );
+                // A recent NE failure skips the doomed launch (each waits
+                // out a 10 s control-channel timeout) and goes straight to
+                // the decision above; see `cached_ne_failure` for why it
+                // expires and why multi-device callers never use it.
+                let cached_ne_error = ios::system_proxy::cached_ne_failure(
+                    self.svc.ios_ne_unavailable.read().await.as_ref(),
+                    req.require_isolation,
+                    std::time::Instant::now(),
+                );
+                let ne_known_bad = cached_ne_error.is_some();
+                let ne_result = if let Some(cached) = cached_ne_error {
+                    debug!("Skipping NE attempt (previously failed: {cached})");
+                    Err(anyhow::anyhow!("{cached}"))
+                } else {
+                    crate::ios_redirect::IosRedirect::start(
+                        serial.clone(),
+                        proxy.state_handle(),
+                        Arc::clone(mitm_ca),
+                    )
+                    .await
+                };
+                match ne_result {
+                    Ok(redirect) => {
+                        *self.svc.ios_redirect.write().await = Some(redirect);
+                        *self.svc.ios_ne_unavailable.write().await = None;
+                        route = proto::NetworkCaptureRoute::IosNetworkExtension;
+                        info!(
+                            %serial, host_port,
+                            "iOS redirector session established"
+                        );
+                    }
+                    Err(e) => {
+                        if !ne_known_bad && !req.require_isolation {
+                            *self.svc.ios_ne_unavailable.write().await =
+                                Some(ios::system_proxy::NeFailure {
+                                    message: e.to_string(),
+                                    at: std::time::Instant::now(),
+                                });
+                            warn!("Network Extension redirector unavailable: {e}");
+                        }
+                        // Two daemons launching the redirector at once used to
+                        // be the most common local cause of an NE failure (they
+                        // share one NETransparentProxyManager and the loser's
+                        // control channel never connects); launches are now
+                        // serialised by `ios_redirect::LaunchLock`.
+                        if decision == ios::system_proxy::FallbackDecision::RefuseIsolation {
+                            let msg = format!(
+                                "iOS network capture unavailable for this device: the \
+                                     Network Extension redirector failed ({e}) and the \
+                                     macOS system-proxy fallback is not device-isolated, so \
+                                     it is refused for multi-device runs. See \
+                                     docs/ios-network-capture.md#multi-device-groups"
+                            );
+                            warn!("{msg}");
+                            return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                                request_id,
+                                success: false,
+                                proxy_port: 0,
+                                error_message: msg,
+                                ..Default::default()
+                            }));
+                        }
+                        if decision == ios::system_proxy::FallbackDecision::RefuseLocal {
+                            let msg = format!(
+                                    "iOS network capture unavailable for {serial}: the Network \
+                                     Extension redirector failed ({e}). Run `npx tapsmith \
+                                     doctor` and `npx tapsmith ios network setup-simulator` to fix it. The \
+                                     macOS system-proxy fallback would record all traffic on \
+                                     this Mac, so it is only used on CI; set {}=1 to allow it \
+                                     here anyway. See docs/ios-network-capture.md",
+                                    ios::system_proxy::FALLBACK_ENV
+                                );
+                            warn!("{msg}");
+                            return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                                request_id,
+                                success: false,
+                                proxy_port: 0,
+                                error_message: msg,
+                                ..Default::default()
+                            }));
+                        }
+                        // `acquire` releases a lease whose caller was
+                        // cancelled mid-acquire; from here until the capture
+                        // is published the guard does the same.
+                        match ios::system_proxy::acquire(host_port).await {
+                            Ok(lease) => {
+                                pending_lease = Some(ios::system_proxy::PendingLease::new(lease));
+                                route = proto::NetworkCaptureRoute::IosSystemProxy;
+                                warnings.push(system_proxy_fallback_warning(&serial));
+                            }
+                            Err(proxy_err) => {
+                                let msg = format!(
+                                    "iOS network capture unavailable for {serial}: Network \
+                                         Extension failed ({e}), system proxy fallback also \
+                                         failed ({proxy_err})"
+                                );
+                                error!("{msg}");
+                                return Err(CaptureStop::Respond(
+                                    proto::StartNetworkCaptureResponse {
+                                        request_id,
+                                        success: false,
+                                        proxy_port: 0,
+                                        error_message: msg,
+                                        ..Default::default()
+                                    },
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                    request_id,
+                    success: false,
+                    proxy_port: 0,
+                    error_message: "iOS network capture requires macOS".to_string(),
+                    ..Default::default()
+                }));
+            }
+        } else {
+            // PILOT-185 physical-device path — the device already has the
+            // mobileconfig installed, so its outbound HTTP traffic is
+            // directed at us via the standard HTTP proxy protocol. The
+            // existing `handle_connection` path inside NetworkProxy
+            // transparently handles CONNECT / GET-with-absolute-URL
+            // requests from the device, so no redirector is needed.
+            route = proto::NetworkCaptureRoute::IosDeviceProxy;
+            info!(
+                %serial,
+                host_port,
+                "Physical iOS proxy listening for device HTTP_PROXY traffic"
+            );
+        }
+        Ok(CaptureRoute {
+            route,
+            #[cfg(target_os = "macos")]
+            pending_lease,
+        })
+    }
+
+    async fn release_capture_route(
+        &self,
+        serial: &str,
+        _reverse_port: Option<u16>,
+        _ca_cert_path: Option<String>,
+        _used_iptables: bool,
+    ) {
+        // PILOT-182 simulators: the redirector session handle was
+        // dropped above, BEFORE `proxy.stop()`. Drop closes the
+        // control channel, which tells the SE to remove this
+        // worker's per-PID filter; the accept + refresh tasks abort
+        // and the Unix socket file is unlinked.
+        //
+        // PILOT-185 physical devices: the ios_redirect slot is
+        // always None on that path — the device's own HTTP proxy
+        // setting (installed via mobileconfig) is the routing
+        // mechanism and it persists across runs by design.
+        info!(%serial, "iOS proxy stopped");
+    }
+
+    async fn release_capture_route_on_shutdown(
+        &self,
+        serial: &str,
+        _reverse_port: Option<u16>,
+        _ca_cert_path: Option<String>,
+        _used_iptables: bool,
+    ) {
+        info!(%serial, "iOS proxy stopped on shutdown");
     }
 }

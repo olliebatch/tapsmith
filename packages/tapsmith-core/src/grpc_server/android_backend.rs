@@ -1,6 +1,8 @@
 //! Android device work: ADB on the host plus the UIAutomator2 agent.
 
-use super::device_backend::{ActionResult, DeviceBackend, PermissionChange};
+use super::device_backend::{
+    ActionResult, CaptureRoute, CaptureStop, DeviceBackend, PermissionChange,
+};
 use super::*;
 
 pub(super) struct AndroidBackend<'a> {
@@ -1106,5 +1108,244 @@ impl DeviceBackend for AndroidBackend<'_> {
 
     async fn agent_start_diagnostics(&self, serial: &str) -> String {
         android_agent_start_diagnostics(serial).await
+    }
+
+    async fn trust_capture_ca(
+        &self,
+        _request_id: String,
+        serial: String,
+        mitm_ca: &Arc<MitmAuthority>,
+        ca_pem_path: &str,
+        warnings: &mut Vec<String>,
+        tunnel_all_tls: &mut Option<String>,
+    ) -> Result<(), CaptureStop> {
+        let cert_filename = mitm_ca
+            .device_cert_filename()
+            .map_err(|e| Status::internal(format!("Failed to compute CA cert hash: {e}")))?;
+        match adb::install_ca_cert(&serial, ca_pem_path, &cert_filename).await {
+            Ok(installed_path) => {
+                *self.svc.proxy_ca_cert_path.write().await = Some(installed_path);
+            }
+            Err(e) => {
+                let (tunnel, msg) = android_ca_install_failure(&e);
+                if tunnel {
+                    *tunnel_all_tls = Some(msg.clone());
+                }
+                error!("{msg}");
+                warnings.push(msg);
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_capture_proxy(
+        &self,
+        _request_id: String,
+        _serial: String,
+        mitm_ca: &Arc<MitmAuthority>,
+    ) -> Result<NetworkProxy, CaptureStop> {
+        Ok(NetworkProxy::start(Arc::clone(mitm_ca))
+            .await
+            .map_err(|e| Status::internal(format!("Failed to start proxy: {e}")))?)
+    }
+
+    async fn check_capture_reachable(
+        &self,
+        _request_id: String,
+        _host_port: u16,
+    ) -> Result<(), CaptureStop> {
+        Ok(())
+    }
+
+    async fn route_capture_traffic(
+        &self,
+        request_id: String,
+        serial: String,
+        _req: &proto::StartNetworkCaptureRequest,
+        _proxy: &NetworkProxy,
+        _mitm_ca: &Arc<MitmAuthority>,
+        host_port: u16,
+        http_ports: &[u16],
+        warnings: &mut Vec<String>,
+    ) -> Result<CaptureRoute, CaptureStop> {
+        let route: proto::NetworkCaptureRoute;
+        {
+            // Use `adb reverse` to make the proxy reachable as
+            // 127.0.0.1:{device_port} on the device. The host proxy port
+            // is OS-assigned and only known to be free on the host; the
+            // same number can still be occupied on the device. Try it
+            // first for continuity, then fall back to alternate device
+            // ports while forwarding all of them to the same host port.
+            let device_port = match setup_android_reverse_with_fallback(&serial, host_port).await {
+                Ok(port) => port,
+                Err(msg) => {
+                    error!("{msg}");
+                    return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                        request_id,
+                        success: false,
+                        proxy_port: 0,
+                        error_message: msg,
+                        ..Default::default()
+                    }));
+                }
+            };
+
+            info!(%serial, device_port, host_port, "Configuring Android proxy");
+
+            // PILOT-187: Use iptables transparent redirect instead of the
+            // system HTTP proxy setting. Some Android HTTP clients (notably
+            // React Native's fetch/OkHttp) don't issue CONNECT tunnels for
+            // HTTPS through the system proxy, causing HTTPS traffic to be
+            // recorded as http://. Transparent redirect intercepts at the
+            // TCP level, so TLS is correctly detected from the ClientHello.
+            let iptables_ok = adb::setup_iptables_redirect(&serial, device_port, http_ports).await;
+            *self.svc.proxy_uses_iptables.write().await = iptables_ok;
+            route = if iptables_ok {
+                proto::NetworkCaptureRoute::AndroidTransparent
+            } else {
+                proto::NetworkCaptureRoute::AndroidHttpProxy
+            };
+            // The redirect is IPv4-only. On a device with IPv6 egress, an
+            // app that prefers IPv6 bypasses it entirely and its traffic is
+            // *invisible* — no capture entry and no `passthrough` marker,
+            // which reads as "the app made no request". Say so rather than
+            // letting it look like a capture bug. (Emulators normally have
+            // no IPv6 default route, so this stays quiet there.)
+            if iptables_ok && adb::has_ipv6_default_route(&serial).await {
+                let msg = "Device has IPv6 connectivity but the transparent redirect \
+                               is IPv4-only — traffic the app sends over IPv6 bypasses \
+                               capture entirely and will not appear in the trace"
+                    .to_string();
+                warn!(%serial, "{msg}");
+                warnings.push(msg);
+            }
+            if !iptables_ok {
+                // Fallback: set the system HTTP proxy for non-rooted devices
+                // or emulators where iptables is unavailable.
+                warn!(
+                    %serial,
+                    "iptables redirect unavailable, falling back to system HTTP proxy"
+                );
+                let proxy_setting = format!("127.0.0.1:{device_port}");
+                if let Err(e) = adb::shell(
+                    &serial,
+                    &format!("settings put global http_proxy {proxy_setting}"),
+                )
+                .await
+                {
+                    let msg = format!("Failed to configure Android HTTP proxy: {e}");
+                    error!("{msg}");
+                    return Err(CaptureStop::Respond(proto::StartNetworkCaptureResponse {
+                        request_id,
+                        success: false,
+                        proxy_port: 0,
+                        error_message: msg,
+                        ..Default::default()
+                    }));
+                }
+                warnings.push(
+                    "iptables redirect unavailable; using Android system HTTP proxy fallback"
+                        .to_string(),
+                );
+            }
+            *self.svc.proxy_reverse_port.write().await = Some(device_port);
+        }
+        Ok(CaptureRoute {
+            route,
+            #[cfg(target_os = "macos")]
+            pending_lease: None,
+        })
+    }
+
+    async fn release_capture_route(
+        &self,
+        serial: &str,
+        reverse_port: Option<u16>,
+        ca_cert_path: Option<String>,
+        used_iptables: bool,
+    ) {
+        info!(%serial, "Reverting Android proxy configuration");
+        // Run cleanup commands concurrently — they're independent
+        // and each has its own timeout. Sequential execution on
+        // slow CI emulators can exceed the gRPC deadline.
+        let serial_a = serial.to_string();
+        let serial_b = serial.to_string();
+        let serial_c = serial.to_string();
+        let proxy_cleanup = async move {
+            if used_iptables {
+                adb::cleanup_iptables_redirect(&serial_a).await;
+            } else if let Err(e) = adb::shell_with_timeout(
+                &serial_a,
+                "settings put global http_proxy :0",
+                ANDROID_PROXY_CLEANUP_TIMEOUT,
+            )
+            .await
+            {
+                warn!(serial = %serial_a, "Failed to reset http_proxy: {e}");
+            }
+        };
+        let reverse_cleanup = async move {
+            if let Some(port) = reverse_port {
+                if let Err(e) =
+                    adb::remove_reverse_with_timeout(&serial_b, port, ANDROID_PROXY_CLEANUP_TIMEOUT)
+                        .await
+                {
+                    warn!(serial = %serial_b, port, "Failed to remove reverse port forward: {e}");
+                }
+            }
+        };
+        let cert_cleanup = async move {
+            if let Some(cert_path) = &ca_cert_path {
+                if let Err(e) = adb::shell_with_timeout(
+                    &serial_c,
+                    &format!("rm -f {cert_path}"),
+                    ANDROID_PROXY_CLEANUP_TIMEOUT,
+                )
+                .await
+                {
+                    warn!(serial = %serial_c, "Failed to remove CA cert: {e}");
+                }
+            }
+        };
+        tokio::join!(proxy_cleanup, reverse_cleanup, cert_cleanup);
+    }
+
+    async fn release_capture_route_on_shutdown(
+        &self,
+        serial: &str,
+        reverse_port: Option<u16>,
+        ca_cert_path: Option<String>,
+        used_iptables: bool,
+    ) {
+        info!(%serial, "Cleaning up Android proxy settings on shutdown");
+        if used_iptables {
+            adb::cleanup_iptables_redirect(serial).await;
+        } else if let Err(e) = adb::shell_with_timeout(
+            serial,
+            "settings put global http_proxy :0",
+            ANDROID_PROXY_CLEANUP_TIMEOUT,
+        )
+        .await
+        {
+            warn!(%serial, "Failed to reset http_proxy on shutdown: {e}");
+        }
+        if let Some(port) = reverse_port {
+            if let Err(e) =
+                adb::remove_reverse_with_timeout(serial, port, ANDROID_PROXY_CLEANUP_TIMEOUT).await
+            {
+                warn!(%serial, port, "Failed to remove reverse port forward on shutdown: {e}");
+            }
+        }
+        if let Some(cert_path) = &ca_cert_path {
+            if let Err(e) = adb::shell_with_timeout(
+                serial,
+                &format!("rm -f {cert_path}"),
+                ANDROID_PROXY_CLEANUP_TIMEOUT,
+            )
+            .await
+            {
+                warn!(%serial, "Failed to remove CA cert on shutdown: {e}");
+            }
+        }
     }
 }

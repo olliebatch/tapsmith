@@ -1511,47 +1511,15 @@ impl TapsmithServiceImpl {
         }
 
         if let Some(serial) = &serial {
-            match platform {
-                Some(Platform::Ios) => {
-                    info!(%serial, "iOS proxy stopped on shutdown");
-                }
-                _ => {
-                    info!(%serial, "Cleaning up Android proxy settings on shutdown");
-                    if used_iptables {
-                        adb::cleanup_iptables_redirect(serial).await;
-                    } else if let Err(e) = adb::shell_with_timeout(
-                        serial,
-                        "settings put global http_proxy :0",
-                        ANDROID_PROXY_CLEANUP_TIMEOUT,
-                    )
-                    .await
-                    {
-                        warn!(%serial, "Failed to reset http_proxy on shutdown: {e}");
-                    }
-                    if let Some(port) = reverse_port {
-                        if let Err(e) = adb::remove_reverse_with_timeout(
-                            serial,
-                            port,
-                            ANDROID_PROXY_CLEANUP_TIMEOUT,
-                        )
-                        .await
-                        {
-                            warn!(%serial, port, "Failed to remove reverse port forward on shutdown: {e}");
-                        }
-                    }
-                    if let Some(cert_path) = &ca_cert_path {
-                        if let Err(e) = adb::shell_with_timeout(
-                            serial,
-                            &format!("rm -f {cert_path}"),
-                            ANDROID_PROXY_CLEANUP_TIMEOUT,
-                        )
-                        .await
-                        {
-                            warn!(%serial, "Failed to remove CA cert on shutdown: {e}");
-                        }
-                    }
-                }
-            }
+            // A capture with no recorded platform is reverted the Android way, as before.
+            device_backend::for_platform(self, platform.unwrap_or(Platform::Android))
+                .release_capture_route_on_shutdown(
+                    serial,
+                    reverse_port,
+                    ca_cert_path,
+                    used_iptables,
+                )
+                .await;
         }
 
         // Explicit drop BEFORE `proxy.stop()` — see comment above. On
@@ -4031,154 +3999,33 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         let serial = self.active_serial().await?;
         let platform = self.require_platform().await?;
+        let backend = device_backend::for_platform(self, platform);
         let ca_pem_path = mitm_ca.ca_pem_path().to_string_lossy().to_string();
         let mut warnings: Vec<String> = Vec::new();
         // The warning, when the device cannot trust the CA and all TLS is
         // tunneled — see `android_ca_install_failure`.
         let mut tunnel_all_tls: Option<String> = None;
 
-        let is_ios_physical = self.is_active_ios_physical().await;
-
-        match platform {
-            Platform::Ios if !is_ios_physical => {
-                // Simulator path — install CA into the simulator's trust store
-                // once per session; it stays trusted for subsequent captures.
-                // Per-UDID set, not a single slot: workers switching between
-                // simulators on a shared daemon would otherwise evict each
-                // other's entry and re-run the slow install on every switch.
-                let already_installed = self
-                    .ios_ca_cert_installed
-                    .read()
-                    .await
-                    .contains(serial.as_str());
-                if already_installed {
-                    debug!(%serial, "MITM CA already installed on simulator this session");
-                } else {
-                    match ios::device::install_ca_cert(&serial, &ca_pem_path).await {
-                        Ok(()) => {
-                            self.ios_ca_cert_installed
-                                .write()
-                                .await
-                                .insert(serial.clone());
-                        }
-                        Err(e) => {
-                            let msg = format!(
-                                "Failed to install CA cert on simulator: {e} — HTTPS traffic will not be captured"
-                            );
-                            error!("{msg}");
-                            warnings.push(msg);
-                        }
-                    }
-                }
-            }
-            Platform::Ios => {
-                // Physical device path (PILOT-185) — the CA is trusted via the
-                // mobileconfig the user installed on the device, so there's
-                // nothing to install from the host. We just verify the
-                // mobileconfig exists and warn loudly if it's missing, since
-                // without it the device has no route into our proxy and no
-                // trust for our CA.
-                #[cfg(target_os = "macos")]
-                {
-                    if !ios::physical_device_proxy::mobileconfig_exists(&serial).await {
-                        return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                            request_id,
-                            success: false,
-                            proxy_port: 0,
-                            error_message: format!(
-                                "No Tapsmith network profile found for device {serial}. \
-                                 Run `tapsmith ios network configure {serial}` first, then \
-                                 install the generated .mobileconfig on the device."
-                            ),
-                            ..Default::default()
-                        }));
-                    }
-                    // Warn if the host's Wi-Fi IP has drifted from what the
-                    // mobileconfig was generated against.
-                    if let Ok(Some(meta)) =
-                        ios::physical_device_proxy::read_mobileconfig_meta(&serial).await
-                    {
-                        if let Ok(current_ip) =
-                            ios::physical_device_proxy::resolve_host_wifi_ip().await
-                        {
-                            if ios::physical_device_proxy::is_mobileconfig_stale(&meta, current_ip)
-                                .await
-                            {
-                                let msg = format!(
-                                    "Host Wi-Fi IP changed since mobileconfig was generated ({} → {}). \
-                                     Run `tapsmith ios network configure {serial} --refresh` and reinstall the profile.",
-                                    meta.host_ip, current_ip
-                                );
-                                warn!("{msg}");
-                                warnings.push(msg);
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                        request_id,
-                        success: false,
-                        proxy_port: 0,
-                        error_message: "Physical iOS network capture requires macOS".to_string(),
-                        ..Default::default()
-                    }));
-                }
-            }
-            Platform::Android => {
-                let cert_filename = mitm_ca.device_cert_filename().map_err(|e| {
-                    Status::internal(format!("Failed to compute CA cert hash: {e}"))
-                })?;
-                match adb::install_ca_cert(&serial, &ca_pem_path, &cert_filename).await {
-                    Ok(installed_path) => {
-                        *self.proxy_ca_cert_path.write().await = Some(installed_path);
-                    }
-                    Err(e) => {
-                        let (tunnel, msg) = android_ca_install_failure(&e);
-                        if tunnel {
-                            tunnel_all_tls = Some(msg.clone());
-                        }
-                        error!("{msg}");
-                        warnings.push(msg);
-                    }
-                }
-            }
+        if let Err(stop) = backend
+            .trust_capture_ca(
+                request_id.clone(),
+                serial.clone(),
+                &mitm_ca,
+                &ca_pem_path,
+                &mut warnings,
+                &mut tunnel_all_tls,
+            )
+            .await
+        {
+            return stop.into_response();
         }
 
-        // Pick the proxy bind address based on device type. Simulators and
-        // Android both want loopback (they reach the proxy via transparent
-        // redirection or adb reverse). Physical iOS devices need a LAN-
-        // reachable listener on a deterministic per-UDID port so their
-        // installed mobileconfig can route traffic here.
-        let proxy = if is_ios_physical {
-            #[cfg(target_os = "macos")]
-            {
-                let port = ios::physical_device_proxy::deterministic_port(&serial);
-                let bind = std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                    port,
-                );
-                NetworkProxy::start_on(Arc::clone(&mitm_ca), bind)
-                    .await
-                    .map_err(|e| {
-                        Status::internal(format!("Failed to start proxy on {bind}: {e}"))
-                    })?
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                    request_id,
-                    success: false,
-                    proxy_port: 0,
-                    error_message: "Physical iOS network capture requires macOS".to_string(),
-                    ..Default::default()
-                }));
-            }
-        } else {
-            NetworkProxy::start(Arc::clone(&mitm_ca))
-                .await
-                .map_err(|e| Status::internal(format!("Failed to start proxy: {e}")))?
+        let proxy = match backend
+            .start_capture_proxy(request_id.clone(), serial.clone(), &mitm_ca)
+            .await
+        {
+            Ok(proxy) => proxy,
+            Err(stop) => return stop.into_response(),
         };
         // Clone out of the read guard before awaiting — holding a RwLock
         // guard across an await risks starving writers.
@@ -4199,296 +4046,30 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         proxy.set_tunnel_all_tls(tunnel_all_tls).await;
         let host_port = proxy.port();
 
-        // Physical iOS: verify the proxy is reachable from the LAN. On
-        // modern macOS the Application Firewall's stealth mode silently
-        // drops inbound TCP SYNs to user processes, even when the binary
-        // is explicitly allowed in the firewall list. The symptom is the
-        // device never reaches the proxy — traffic capture silently
-        // returns 0 entries and users spend an hour debugging SSID /
-        // profile install / Wi-Fi before finding the real cause.
-        //
-        // Check by connecting to our own LAN IP on the proxy port. If
-        // that times out, the firewall (or similar) is blocking and we
-        // return a clear error with the exact socketfilterfw fix.
-        #[cfg(target_os = "macos")]
-        if is_ios_physical {
-            if let Ok(lan_ip) = ios::physical_device_proxy::resolve_host_wifi_ip().await {
-                let reachable = self_probe_lan_listener(lan_ip, host_port).await;
-                if !reachable {
-                    // Drop the proxy — otherwise the next start_network_capture
-                    // call will fail with "already running".
-                    drop(proxy);
-                    return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                        request_id,
-                        success: false,
-                        proxy_port: 0,
-                        error_message: format!(
-                            "Tapsmith proxy is bound to {lan_ip}:{host_port} but inbound LAN \
-                             connections are being blocked — the iPhone will never reach it.\n\n\
-                             Most likely cause: macOS Application Firewall stealth mode is \
-                             silently dropping unsolicited inbound TCP SYNs, even for \
-                             allow-listed binaries. Disable it with:\n  \
-                             sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setstealthmode off\n\n\
-                             Or disable the firewall entirely for this session:\n  \
-                             sudo /usr/libexec/ApplicationFirewall/socketfilterfw --setglobalstate off"
-                        ),
-                        ..Default::default()
-                    }));
-                }
-            }
+        if let Err(stop) = backend
+            .check_capture_reachable(request_id.clone(), host_port)
+            .await
+        {
+            return stop.into_response();
         }
 
-        let route: proto::NetworkCaptureRoute;
-        #[cfg(target_os = "macos")]
-        let mut pending_lease: Option<ios::system_proxy::PendingLease> = None;
-        match platform {
-            Platform::Ios if !is_ios_physical => {
-                // PILOT-182: route the simulator's traffic into the MITM
-                // proxy via the macOS Network Extension redirector instead
-                // of a global system proxy. Per-PID filtering gives each
-                // worker daemon full isolation from other concurrent
-                // workers (and from the user's host traffic).
-                //
-                // If the redirector fails to start (SE not approved, brew
-                // missing, launcher binary unreachable, …), there is NO
-                // path for traffic to reach the proxy — capture is
-                // effectively dead. Early-return `success: false` so the
-                // runner prints "Network capture disabled" instead of the
-                // misleading "warning". The local `proxy` is dropped at
-                // end of scope, releasing the TCP listener.
-                #[cfg(target_os = "macos")]
-                {
-                    // The system-proxy fallback is host-wide: it records every
-                    // process on the Mac (browsers, trustd, other simulators)
-                    // and nothing in the captured entries says which. It is
-                    // refused when the caller needs per-device attribution (the
-                    // runner, for a multi-device group) and, unless opted in,
-                    // outside CI — a developer Mac has the Network Extension, so
-                    // falling back there hides a real failure behind a capture
-                    // of the developer's own browsing (PILOT-319).
-                    let decision = ios::system_proxy::fallback_decision(
-                        req.require_isolation,
-                        ios::system_proxy::fallback_allowed_from_env(),
-                    );
-                    // A recent NE failure skips the doomed launch (each waits
-                    // out a 10 s control-channel timeout) and goes straight to
-                    // the decision above; see `cached_ne_failure` for why it
-                    // expires and why multi-device callers never use it.
-                    let cached_ne_error = ios::system_proxy::cached_ne_failure(
-                        self.ios_ne_unavailable.read().await.as_ref(),
-                        req.require_isolation,
-                        std::time::Instant::now(),
-                    );
-                    let ne_known_bad = cached_ne_error.is_some();
-                    let ne_result = if let Some(cached) = cached_ne_error {
-                        debug!("Skipping NE attempt (previously failed: {cached})");
-                        Err(anyhow::anyhow!("{cached}"))
-                    } else {
-                        crate::ios_redirect::IosRedirect::start(
-                            serial.clone(),
-                            proxy.state_handle(),
-                            Arc::clone(&mitm_ca),
-                        )
-                        .await
-                    };
-                    match ne_result {
-                        Ok(redirect) => {
-                            *self.ios_redirect.write().await = Some(redirect);
-                            *self.ios_ne_unavailable.write().await = None;
-                            route = proto::NetworkCaptureRoute::IosNetworkExtension;
-                            info!(
-                                %serial, host_port,
-                                "iOS redirector session established"
-                            );
-                        }
-                        Err(e) => {
-                            if !ne_known_bad && !req.require_isolation {
-                                *self.ios_ne_unavailable.write().await =
-                                    Some(ios::system_proxy::NeFailure {
-                                        message: e.to_string(),
-                                        at: std::time::Instant::now(),
-                                    });
-                                warn!("Network Extension redirector unavailable: {e}");
-                            }
-                            // Two daemons launching the redirector at once used to
-                            // be the most common local cause of an NE failure (they
-                            // share one NETransparentProxyManager and the loser's
-                            // control channel never connects); launches are now
-                            // serialised by `ios_redirect::LaunchLock`.
-                            if decision == ios::system_proxy::FallbackDecision::RefuseIsolation {
-                                let msg = format!(
-                                    "iOS network capture unavailable for this device: the \
-                                     Network Extension redirector failed ({e}) and the \
-                                     macOS system-proxy fallback is not device-isolated, so \
-                                     it is refused for multi-device runs. See \
-                                     docs/ios-network-capture.md#multi-device-groups"
-                                );
-                                warn!("{msg}");
-                                return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                                    request_id,
-                                    success: false,
-                                    proxy_port: 0,
-                                    error_message: msg,
-                                    ..Default::default()
-                                }));
-                            }
-                            if decision == ios::system_proxy::FallbackDecision::RefuseLocal {
-                                let msg = format!(
-                                    "iOS network capture unavailable for {serial}: the Network \
-                                     Extension redirector failed ({e}). Run `npx tapsmith \
-                                     doctor` and `npx tapsmith ios network setup-simulator` to fix it. The \
-                                     macOS system-proxy fallback would record all traffic on \
-                                     this Mac, so it is only used on CI; set {}=1 to allow it \
-                                     here anyway. See docs/ios-network-capture.md",
-                                    ios::system_proxy::FALLBACK_ENV
-                                );
-                                warn!("{msg}");
-                                return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                                    request_id,
-                                    success: false,
-                                    proxy_port: 0,
-                                    error_message: msg,
-                                    ..Default::default()
-                                }));
-                            }
-                            // `acquire` releases a lease whose caller was
-                            // cancelled mid-acquire; from here until the capture
-                            // is published the guard does the same.
-                            match ios::system_proxy::acquire(host_port).await {
-                                Ok(lease) => {
-                                    pending_lease =
-                                        Some(ios::system_proxy::PendingLease::new(lease));
-                                    route = proto::NetworkCaptureRoute::IosSystemProxy;
-                                    warnings.push(system_proxy_fallback_warning(&serial));
-                                }
-                                Err(proxy_err) => {
-                                    let msg = format!(
-                                        "iOS network capture unavailable for {serial}: Network \
-                                         Extension failed ({e}), system proxy fallback also \
-                                         failed ({proxy_err})"
-                                    );
-                                    error!("{msg}");
-                                    return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                                        request_id,
-                                        success: false,
-                                        proxy_port: 0,
-                                        error_message: msg,
-                                        ..Default::default()
-                                    }));
-                                }
-                            }
-                        }
-                    }
-                }
-                #[cfg(not(target_os = "macos"))]
-                {
-                    return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                        request_id,
-                        success: false,
-                        proxy_port: 0,
-                        error_message: "iOS network capture requires macOS".to_string(),
-                        ..Default::default()
-                    }));
-                }
-            }
-            Platform::Ios => {
-                // PILOT-185 physical-device path — the device already has the
-                // mobileconfig installed, so its outbound HTTP traffic is
-                // directed at us via the standard HTTP proxy protocol. The
-                // existing `handle_connection` path inside NetworkProxy
-                // transparently handles CONNECT / GET-with-absolute-URL
-                // requests from the device, so no redirector is needed.
-                route = proto::NetworkCaptureRoute::IosDeviceProxy;
-                info!(
-                    %serial,
-                    host_port,
-                    "Physical iOS proxy listening for device HTTP_PROXY traffic"
-                );
-            }
-            Platform::Android => {
-                // Use `adb reverse` to make the proxy reachable as
-                // 127.0.0.1:{device_port} on the device. The host proxy port
-                // is OS-assigned and only known to be free on the host; the
-                // same number can still be occupied on the device. Try it
-                // first for continuity, then fall back to alternate device
-                // ports while forwarding all of them to the same host port.
-                let device_port =
-                    match setup_android_reverse_with_fallback(&serial, host_port).await {
-                        Ok(port) => port,
-                        Err(msg) => {
-                            error!("{msg}");
-                            return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                                request_id,
-                                success: false,
-                                proxy_port: 0,
-                                error_message: msg,
-                                ..Default::default()
-                            }));
-                        }
-                    };
-
-                info!(%serial, device_port, host_port, "Configuring Android proxy");
-
-                // PILOT-187: Use iptables transparent redirect instead of the
-                // system HTTP proxy setting. Some Android HTTP clients (notably
-                // React Native's fetch/OkHttp) don't issue CONNECT tunnels for
-                // HTTPS through the system proxy, causing HTTPS traffic to be
-                // recorded as http://. Transparent redirect intercepts at the
-                // TCP level, so TLS is correctly detected from the ClientHello.
-                let iptables_ok =
-                    adb::setup_iptables_redirect(&serial, device_port, &http_ports).await;
-                *self.proxy_uses_iptables.write().await = iptables_ok;
-                route = if iptables_ok {
-                    proto::NetworkCaptureRoute::AndroidTransparent
-                } else {
-                    proto::NetworkCaptureRoute::AndroidHttpProxy
-                };
-                // The redirect is IPv4-only. On a device with IPv6 egress, an
-                // app that prefers IPv6 bypasses it entirely and its traffic is
-                // *invisible* — no capture entry and no `passthrough` marker,
-                // which reads as "the app made no request". Say so rather than
-                // letting it look like a capture bug. (Emulators normally have
-                // no IPv6 default route, so this stays quiet there.)
-                if iptables_ok && adb::has_ipv6_default_route(&serial).await {
-                    let msg = "Device has IPv6 connectivity but the transparent redirect \
-                               is IPv4-only — traffic the app sends over IPv6 bypasses \
-                               capture entirely and will not appear in the trace"
-                        .to_string();
-                    warn!(%serial, "{msg}");
-                    warnings.push(msg);
-                }
-                if !iptables_ok {
-                    // Fallback: set the system HTTP proxy for non-rooted devices
-                    // or emulators where iptables is unavailable.
-                    warn!(
-                        %serial,
-                        "iptables redirect unavailable, falling back to system HTTP proxy"
-                    );
-                    let proxy_setting = format!("127.0.0.1:{device_port}");
-                    if let Err(e) = adb::shell(
-                        &serial,
-                        &format!("settings put global http_proxy {proxy_setting}"),
-                    )
-                    .await
-                    {
-                        let msg = format!("Failed to configure Android HTTP proxy: {e}");
-                        error!("{msg}");
-                        return Ok(Response::new(proto::StartNetworkCaptureResponse {
-                            request_id,
-                            success: false,
-                            proxy_port: 0,
-                            error_message: msg,
-                            ..Default::default()
-                        }));
-                    }
-                    warnings.push(
-                        "iptables redirect unavailable; using Android system HTTP proxy fallback"
-                            .to_string(),
-                    );
-                }
-                *self.proxy_reverse_port.write().await = Some(device_port);
-            }
-        }
+        let captured_route = match backend
+            .route_capture_traffic(
+                request_id.clone(),
+                serial.clone(),
+                &req,
+                &proxy,
+                &mitm_ca,
+                host_port,
+                &http_ports,
+                &mut warnings,
+            )
+            .await
+        {
+            Ok(captured_route) => captured_route,
+            Err(stop) => return stop.into_response(),
+        };
+        let route = captured_route.route;
 
         if *self.proxy_uses_iptables.read().await {
             *self.proxy_http_ports.write().await = http_ports;
@@ -4503,7 +4084,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         // await in between, so a cancellation either releases the lease with
         // the unpublished proxy or leaves both published.
         #[cfg(target_os = "macos")]
-        if let Some(pending) = pending_lease {
+        if let Some(pending) = captured_route.pending_lease {
             let mut lease_slot = self.ios_system_proxy.write().await;
             *lease_slot = Some(pending.disarm());
         }
@@ -4673,70 +4254,10 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         // Revert proxy settings based on platform
         if let Some(serial) = &serial {
-            match platform {
-                Some(Platform::Ios) => {
-                    // PILOT-182 simulators: the redirector session handle was
-                    // dropped above, BEFORE `proxy.stop()`. Drop closes the
-                    // control channel, which tells the SE to remove this
-                    // worker's per-PID filter; the accept + refresh tasks abort
-                    // and the Unix socket file is unlinked.
-                    //
-                    // PILOT-185 physical devices: the ios_redirect slot is
-                    // always None on that path — the device's own HTTP proxy
-                    // setting (installed via mobileconfig) is the routing
-                    // mechanism and it persists across runs by design.
-                    info!(%serial, "iOS proxy stopped");
-                }
-                _ => {
-                    info!(%serial, "Reverting Android proxy configuration");
-                    // Run cleanup commands concurrently — they're independent
-                    // and each has its own timeout. Sequential execution on
-                    // slow CI emulators can exceed the gRPC deadline.
-                    let serial_a = serial.to_string();
-                    let serial_b = serial.to_string();
-                    let serial_c = serial.to_string();
-                    let proxy_cleanup = async move {
-                        if used_iptables {
-                            adb::cleanup_iptables_redirect(&serial_a).await;
-                        } else if let Err(e) = adb::shell_with_timeout(
-                            &serial_a,
-                            "settings put global http_proxy :0",
-                            ANDROID_PROXY_CLEANUP_TIMEOUT,
-                        )
-                        .await
-                        {
-                            warn!(serial = %serial_a, "Failed to reset http_proxy: {e}");
-                        }
-                    };
-                    let reverse_cleanup = async move {
-                        if let Some(port) = reverse_port {
-                            if let Err(e) = adb::remove_reverse_with_timeout(
-                                &serial_b,
-                                port,
-                                ANDROID_PROXY_CLEANUP_TIMEOUT,
-                            )
-                            .await
-                            {
-                                warn!(serial = %serial_b, port, "Failed to remove reverse port forward: {e}");
-                            }
-                        }
-                    };
-                    let cert_cleanup = async move {
-                        if let Some(cert_path) = &ca_cert_path {
-                            if let Err(e) = adb::shell_with_timeout(
-                                &serial_c,
-                                &format!("rm -f {cert_path}"),
-                                ANDROID_PROXY_CLEANUP_TIMEOUT,
-                            )
-                            .await
-                            {
-                                warn!(serial = %serial_c, "Failed to remove CA cert: {e}");
-                            }
-                        }
-                    };
-                    tokio::join!(proxy_cleanup, reverse_cleanup, cert_cleanup);
-                }
-            }
+            // A capture with no recorded platform is reverted the Android way, as before.
+            device_backend::for_platform(self, platform.unwrap_or(Platform::Android))
+                .release_capture_route(serial, reverse_port, ca_cert_path, used_iptables)
+                .await;
         }
 
         let capture_session = proxy.capture_session().to_string();
