@@ -1403,6 +1403,10 @@ impl DeviceBackend for IosBackend<'_> {
         request_id: String,
         serial: String,
     ) -> Result<Response<proto::ListWebViewsResponse>, Status> {
+        // Note: the iOS TypeScript SDK connects directly to the simulator's
+        // webinspectord socket (webkit-inspector.ts) and does not use this
+        // RPC. This path exists as a server-side fallback via
+        // ios-webkit-debug-proxy for potential future use.
         #[cfg(target_os = "macos")]
         {
             use crate::ios::webkit_debug_proxy::WebkitDebugProxyHandle;
