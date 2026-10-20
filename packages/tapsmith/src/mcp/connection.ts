@@ -2423,9 +2423,13 @@ async function startAgentFromConfig(
  * exactly like every test run path (`resolveAgentArtifacts`): a missing
  * hand-set file is refused, and a physical device gets the device build — a
  * checkout's or the npm install's — instead of a simulator one (PILOT-264).
- * A simulator with nothing set keeps the plain lookup: the shared path would
- * build the simulator agent on demand, which logs to stdout (the stdio MCP
- * protocol channel) and holds the tool call for the whole xcodebuild.
+ * A simulator with nothing set resolves like a test run too, building the
+ * agent when nothing current exists (a first run, an upgrade — PILOT-485 —
+ * or an Xcode update), with its progress logged to stderr: stdout is the
+ * stdio MCP protocol channel. The build holds the tool call until it ends.
+ * With no device known (discovery recovering an orphaned daemon's agent,
+ * which may be a phone) it only looks: a build there would stall discovery
+ * for minutes, perhaps for nothing.
  */
 export async function iosXctestrunForAgentStart(
   config: TapsmithConfig,
@@ -2443,12 +2447,18 @@ export async function iosXctestrunForAgentStart(
   // No device known (recovering an orphaned daemon's agent), or a simulator.
   if (config.iosXctestrun) return path.resolve(config.rootDir, config.iosXctestrun);
   if (process.env.TAPSMITH_IOS_XCTESTRUN) return process.env.TAPSMITH_IOS_XCTESTRUN;
-  try {
-    const { findSimulatorXctestrun } = await import('../ios-device-resolve.js');
-    return findSimulatorXctestrun();
-  } catch {
-    return undefined; // not on macOS, or nothing built
+  if (!serial) {
+    try {
+      const { findSimulatorXctestrun } = await import('../ios-device-resolve.js');
+      return findSimulatorXctestrun();
+    } catch {
+      return undefined; // not on macOS, or nothing built
+    }
   }
+  // Not on macOS, no SDK, or a failed build throws: startAgentFromConfig
+  // names the reason (and fails a required start with it).
+  const { ensureSimulatorAgent } = await import('../ios-simulator-build.js');
+  return ensureSimulatorAgent({ onProgress: log });
 }
 
 // ─── Utilities ───
