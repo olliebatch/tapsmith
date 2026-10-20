@@ -142,6 +142,28 @@ pub(super) trait DeviceBackend: Send + Sync {
     ) -> Result<Response<proto::ScreenshotResponse>, Status>;
     /// Called once a device is selected, before the first app launch.
     async fn prearm_network_tracing(&self, req: &proto::SetDeviceRequest);
+
+    // ─── Agent ───
+    /// Rejects a StartAgent request this platform cannot act on.
+    fn check_start_agent(
+        &self,
+        request_id: &str,
+        req: &proto::StartAgentRequest,
+    ) -> Result<(), proto::ActionResponse>;
+    /// Called when StartAgent reuses the live agent instead of launching one.
+    async fn reuse_agent(&self, serial: &str, req: &proto::StartAgentRequest);
+    /// Installs and launches the on-device agent. A failure is the response to return.
+    async fn launch_agent(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::StartAgentRequest,
+    ) -> Result<(), proto::ActionResponse>;
+    async fn connect_agent(&self, agent: &mut AgentConnection, serial: &str) -> anyhow::Result<()>;
+    /// Best-effort session warm-up once the agent answers.
+    async fn after_agent_connected(&self, serial: &str, target_package: &str);
+    /// Extra detail for an agent that failed to connect, appended to the error.
+    async fn agent_start_diagnostics(&self, serial: &str) -> String;
 }
 
 /// The backend for `platform`, borrowing `svc` for the call.

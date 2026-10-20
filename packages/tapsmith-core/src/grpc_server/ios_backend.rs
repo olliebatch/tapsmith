@@ -1569,4 +1569,142 @@ impl DeviceBackend for IosBackend<'_> {
             }
         }
     }
+
+    fn check_start_agent(
+        &self,
+        request_id: &str,
+        req: &proto::StartAgentRequest,
+    ) -> Result<(), proto::ActionResponse> {
+        if req.ios_xctestrun_path.is_empty() {
+            return Err(proto::ActionResponse {
+                request_id: request_id.to_string(),
+                success: false,
+                error_type: "AGENT_NOT_CONFIGURED".to_string(),
+                error_message: "iOS agent not configured. \
+                    Set iosXctestrun in your Tapsmith config."
+                    .to_string(),
+                screenshot: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn reuse_agent(&self, serial: &str, req: &proto::StartAgentRequest) {
+        #[cfg(target_os = "macos")]
+        if req.network_tracing_enabled && self.svc.is_active_ios_physical().await {
+            self.svc.ensure_ios_physical_proxy(serial).await;
+        }
+    }
+
+    async fn launch_agent(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::StartAgentRequest,
+    ) -> Result<(), proto::ActionResponse> {
+        // ─── iOS: launch XCUITest agent ───
+        let is_physical = self.svc.is_active_ios_physical().await;
+
+        // Apply test-friendly defaults every time the agent starts,
+        // not just on first boot — reused simulators may have stale config.
+        // Skipped entirely on physical devices: the simctl spawns
+        // would fail, and the device's defaults are user-owned anyway.
+        if !is_physical {
+            ios::device::configure_simulator(&serial).await;
+        }
+
+        // Drop any prior iproxy tunnel BEFORE start_agent so the
+        // existing host port is free when start_agent tries to bind
+        // a fresh tunnel. Without this, a re-started agent on the
+        // same physical device would fight its own leftover tunnel.
+        agent_comms::clear_stream_cache(&self.svc.agent_stream).await;
+        *self.svc.ios_iproxy.write().await = None;
+
+        // Re-affirm the server-wide tracing flag. SetDevice is the
+        // primary setter, but StartAgent is called in the same RPC
+        // sequence — keeping both in sync is defensive against
+        // future clients that skip set_device.
+        *self.svc.network_tracing_enabled.write().await = req.network_tracing_enabled;
+
+        // Pre-start the Wi-Fi MITM proxy for physical iOS devices
+        // with tracing enabled. Idempotent — skipped if already
+        // bound (typically from set_device). Re-primes when prior
+        // test's stop_network_capture tore the listener down. When
+        // tracing is off, skipped entirely (see SetDevice for why).
+        #[cfg(target_os = "macos")]
+        if is_physical && req.network_tracing_enabled {
+            self.svc.ensure_ios_physical_proxy(&serial).await;
+        }
+
+        // PILOT-245: before the agent launches the target app, force
+        // gRPC-Core onto the native resolver. Its c-ares resolver emits
+        // UDP DNS from the app process, which the TCP-only redirector
+        // cannot proxy.
+        #[cfg(target_os = "macos")]
+        if !is_physical && req.network_tracing_enabled {
+            ios::device::prepare_grpc_trust(&serial, &req.target_package).await;
+        }
+
+        let agent_port = self.svc.agent.read().await.port();
+        let iproxy_handle = match ios::agent_launch::start_agent(
+            &serial,
+            &req.ios_xctestrun_path,
+            &req.target_package,
+            agent_port,
+            is_physical,
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(e) => {
+                error!(error = %e, "Failed to start iOS agent");
+                return Err(proto::ActionResponse {
+                    request_id,
+                    success: false,
+                    error_type: "AGENT_START_FAILED".to_string(),
+                    error_message: e.to_string(),
+                    screenshot: Vec::new(),
+                });
+            }
+        };
+        if let Some(handle) = iproxy_handle {
+            *self.svc.ios_iproxy.write().await = Some(handle);
+        }
+
+        // Store config for potential agent restart in launchApp
+        *self.svc.ios_agent_config.write().await = Some(IosAgentConfig {
+            xctestrun_path: req.ios_xctestrun_path.clone(),
+            target_package: req.target_package.clone(),
+            app_path: (!req.ios_app_path.is_empty()).then(|| req.ios_app_path.clone()),
+        });
+        Ok(())
+    }
+
+    async fn connect_agent(&self, agent: &mut AgentConnection, serial: &str) -> anyhow::Result<()> {
+        agent.connect_ios(serial).await
+    }
+
+    async fn after_agent_connected(&self, serial: &str, target_package: &str) {
+        // Best-effort pre-warm of the app-container cache while
+        // CoreSimulator is (presumably) healthy: if it wedges later
+        // in the session, app-state save/clear fall back to this
+        // resolved path instead of failing on a timed-out lookup.
+        if !self.svc.is_active_ios_physical().await && !target_package.is_empty() {
+            let cache = self.svc.ios_app_container_cache.clone();
+            let serial_c = serial.to_string();
+            let pkg = target_package.to_string();
+            tokio::spawn(async move {
+                if let Ok(path) = ios::device::get_app_container(&serial_c, &pkg).await {
+                    cache
+                        .write()
+                        .await
+                        .insert(format!("{serial_c}\u{0}{pkg}"), path);
+                }
+            });
+        }
+    }
+
+    async fn agent_start_diagnostics(&self, _serial: &str) -> String {
+        String::new()
+    }
 }

@@ -976,4 +976,135 @@ impl DeviceBackend for AndroidBackend<'_> {
             self.svc.ensure_android_ca_installed(&req.serial).await;
         }
     }
+
+    fn check_start_agent(
+        &self,
+        _request_id: &str,
+        _req: &proto::StartAgentRequest,
+    ) -> Result<(), proto::ActionResponse> {
+        Ok(())
+    }
+
+    async fn reuse_agent(&self, _serial: &str, _req: &proto::StartAgentRequest) {}
+
+    async fn launch_agent(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::StartAgentRequest,
+    ) -> Result<(), proto::ActionResponse> {
+        // ─── Android: install APKs and launch instrumentation ───
+        if let Err(e) = adb::wait_for_device_ready(&serial, Duration::from_secs(45)).await {
+            return Err(proto::ActionResponse {
+                request_id,
+                success: false,
+                error_type: "DEVICE_NOT_READY".to_string(),
+                error_message: format!("Android device was not ready before starting agent: {e}"),
+                screenshot: Vec::new(),
+            });
+        }
+
+        let has_apk_paths = !req.agent_apk_path.is_empty() && !req.agent_test_apk_path.is_empty();
+        let agent_installed = adb::is_package_installed(&serial, "dev.tapsmith.agent")
+            .await
+            .unwrap_or(false);
+
+        if !agent_installed && !has_apk_paths {
+            return Err(proto::ActionResponse {
+                request_id,
+                success: false,
+                error_type: "AGENT_NOT_INSTALLED".to_string(),
+                error_message: "Tapsmith agent is not installed on the device. \
+                            Set agentApk and agentTestApk in your Tapsmith config, \
+                            or install manually with: adb install <path-to-agent.apk>"
+                    .to_string(),
+                screenshot: Vec::new(),
+            });
+        }
+
+        // Always reinstall when APK paths are provided so that code
+        // changes to the agent are deployed without manual intervention.
+        if has_apk_paths {
+            info!("Installing agent APKs...");
+            if let Err(e) = adb::install_apk(&serial, &req.agent_apk_path, true).await {
+                return Err(proto::ActionResponse {
+                    request_id,
+                    success: false,
+                    error_type: "AGENT_INSTALL_FAILED".to_string(),
+                    error_message: format!("Failed to install agent APK: {e}"),
+                    screenshot: Vec::new(),
+                });
+            }
+            if let Err(e) = adb::install_apk(&serial, &req.agent_test_apk_path, true).await {
+                return Err(proto::ActionResponse {
+                    request_id,
+                    success: false,
+                    error_type: "AGENT_INSTALL_FAILED".to_string(),
+                    error_message: format!("Failed to install agent test APK: {e}"),
+                    screenshot: Vec::new(),
+                });
+            }
+            info!("Agent APKs installed successfully");
+        }
+
+        // Launch the agent instrumentation
+        agent_comms::clear_stream_cache(&self.svc.agent_stream).await;
+        let instrument_cmd = if req.target_package.is_empty() {
+            "am instrument -w dev.tapsmith.agent/.TapsmithAgent".to_string()
+        } else {
+            format!(
+                "am instrument -w -e targetPackage {} dev.tapsmith.agent/.TapsmithAgent",
+                req.target_package
+            )
+        };
+
+        // Launch in background on device, keeping the runner's output
+        // on the device for the failure diagnostics below.
+        let bg_cmd = format!("nohup {instrument_cmd} > {ANDROID_AGENT_LOG_PATH} 2>&1 &");
+        if let Err(e) = adb::shell(&serial, &bg_cmd).await {
+            error!(error = %e, "Failed to start agent instrumentation");
+            return Err(proto::ActionResponse {
+                request_id,
+                success: false,
+                error_type: "AGENT_START_FAILED".to_string(),
+                error_message: e.to_string(),
+                screenshot: Vec::new(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn connect_agent(&self, agent: &mut AgentConnection, serial: &str) -> anyhow::Result<()> {
+        // The instrumentation was launched just above. Wait for it to
+        // actually answer: through the forwarded port a bare connect
+        // succeeds before (or without) the agent ever listening.
+        agent
+            .connect_android_with_readiness(serial, ANDROID_AGENT_START_READINESS)
+            .await
+    }
+
+    async fn after_agent_connected(&self, _serial: &str, target_package: &str) {
+        // Resolve and cache the Android launcher activity now, while
+        // the device is calm, so every later clean-task relaunch (the
+        // restart/clear reset rungs) can discard saved instance state
+        // without depending on a `resolve-activity` call landing under
+        // load. `pm clear` wipes app data but NOT the ActivityManager
+        // task record, so a relaunch that can't clear the task brings
+        // back the old route and scroll position.
+        if !target_package.is_empty() {
+            if let Ok(serial) = self.svc.active_serial().await {
+                let activity = self
+                    .svc
+                    .resolve_launcher_activity(&serial, target_package)
+                    .await
+                    .ok()
+                    .flatten();
+                *self.svc.android_launcher_activity.write().await = activity;
+            }
+        }
+    }
+
+    async fn agent_start_diagnostics(&self, serial: &str) -> String {
+        android_agent_start_diagnostics(serial).await
+    }
 }

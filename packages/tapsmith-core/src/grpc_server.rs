@@ -2972,21 +2972,14 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         let serial = self.active_serial().await?;
         let platform = self.require_platform().await?;
+        let backend = device_backend::for_platform(self, platform);
 
         info!(serial = %serial, %platform, "Starting agent connection");
 
         info!(ios_xctestrun_path = %req.ios_xctestrun_path, "StartAgent fields");
 
-        if platform == Platform::Ios && req.ios_xctestrun_path.is_empty() {
-            return Ok(Response::new(proto::ActionResponse {
-                request_id,
-                success: false,
-                error_type: "AGENT_NOT_CONFIGURED".to_string(),
-                error_message: "iOS agent not configured. \
-                    Set iosXctestrun in your Tapsmith config."
-                    .to_string(),
-                screenshot: Vec::new(),
-            }));
+        if let Err(resp) = backend.check_start_agent(&request_id, &req) {
+            return Ok(Response::new(resp));
         }
 
         let desired_agent_config =
@@ -2998,13 +2991,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         *self.network_tracing_enabled.write().await = req.network_tracing_enabled;
 
         if self.can_reuse_started_agent(&desired_agent_config).await {
-            #[cfg(target_os = "macos")]
-            if platform == Platform::Ios
-                && req.network_tracing_enabled
-                && self.is_active_ios_physical().await
-            {
-                self.ensure_ios_physical_proxy(&serial).await;
-            }
+            backend.reuse_agent(&serial, &req).await;
 
             info!(serial = %serial, %platform, "Reusing existing agent connection");
             return Ok(Self::success_action_response(request_id));
@@ -3017,227 +3004,21 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         *self.last_hooks_marker.write().await = None;
         *self.nav_probe_found_no_marker.write().await = false;
 
-        match platform {
-            Platform::Ios => {
-                // ─── iOS: launch XCUITest agent ───
-                let is_physical = self.is_active_ios_physical().await;
-
-                // Apply test-friendly defaults every time the agent starts,
-                // not just on first boot — reused simulators may have stale config.
-                // Skipped entirely on physical devices: the simctl spawns
-                // would fail, and the device's defaults are user-owned anyway.
-                if !is_physical {
-                    ios::device::configure_simulator(&serial).await;
-                }
-
-                // Drop any prior iproxy tunnel BEFORE start_agent so the
-                // existing host port is free when start_agent tries to bind
-                // a fresh tunnel. Without this, a re-started agent on the
-                // same physical device would fight its own leftover tunnel.
-                agent_comms::clear_stream_cache(&self.agent_stream).await;
-                *self.ios_iproxy.write().await = None;
-
-                // Re-affirm the server-wide tracing flag. SetDevice is the
-                // primary setter, but StartAgent is called in the same RPC
-                // sequence — keeping both in sync is defensive against
-                // future clients that skip set_device.
-                *self.network_tracing_enabled.write().await = req.network_tracing_enabled;
-
-                // Pre-start the Wi-Fi MITM proxy for physical iOS devices
-                // with tracing enabled. Idempotent — skipped if already
-                // bound (typically from set_device). Re-primes when prior
-                // test's stop_network_capture tore the listener down. When
-                // tracing is off, skipped entirely (see SetDevice for why).
-                #[cfg(target_os = "macos")]
-                if is_physical && req.network_tracing_enabled {
-                    self.ensure_ios_physical_proxy(&serial).await;
-                }
-
-                // PILOT-245: before the agent launches the target app, force
-                // gRPC-Core onto the native resolver. Its c-ares resolver emits
-                // UDP DNS from the app process, which the TCP-only redirector
-                // cannot proxy.
-                #[cfg(target_os = "macos")]
-                if !is_physical && req.network_tracing_enabled {
-                    ios::device::prepare_grpc_trust(&serial, &req.target_package).await;
-                }
-
-                let agent_port = self.agent.read().await.port();
-                let iproxy_handle = match ios::agent_launch::start_agent(
-                    &serial,
-                    &req.ios_xctestrun_path,
-                    &req.target_package,
-                    agent_port,
-                    is_physical,
-                )
-                .await
-                {
-                    Ok(handle) => handle,
-                    Err(e) => {
-                        error!(error = %e, "Failed to start iOS agent");
-                        return Ok(Response::new(proto::ActionResponse {
-                            request_id,
-                            success: false,
-                            error_type: "AGENT_START_FAILED".to_string(),
-                            error_message: e.to_string(),
-                            screenshot: Vec::new(),
-                        }));
-                    }
-                };
-                if let Some(handle) = iproxy_handle {
-                    *self.ios_iproxy.write().await = Some(handle);
-                }
-
-                // Store config for potential agent restart in launchApp
-                *self.ios_agent_config.write().await = Some(IosAgentConfig {
-                    xctestrun_path: req.ios_xctestrun_path.clone(),
-                    target_package: req.target_package.clone(),
-                    app_path: (!req.ios_app_path.is_empty()).then(|| req.ios_app_path.clone()),
-                });
-            }
-            Platform::Android => {
-                // ─── Android: install APKs and launch instrumentation ───
-                if let Err(e) = adb::wait_for_device_ready(&serial, Duration::from_secs(45)).await {
-                    return Ok(Response::new(proto::ActionResponse {
-                        request_id,
-                        success: false,
-                        error_type: "DEVICE_NOT_READY".to_string(),
-                        error_message: format!(
-                            "Android device was not ready before starting agent: {e}"
-                        ),
-                        screenshot: Vec::new(),
-                    }));
-                }
-
-                let has_apk_paths =
-                    !req.agent_apk_path.is_empty() && !req.agent_test_apk_path.is_empty();
-                let agent_installed = adb::is_package_installed(&serial, "dev.tapsmith.agent")
-                    .await
-                    .unwrap_or(false);
-
-                if !agent_installed && !has_apk_paths {
-                    return Ok(Response::new(proto::ActionResponse {
-                        request_id,
-                        success: false,
-                        error_type: "AGENT_NOT_INSTALLED".to_string(),
-                        error_message: "Tapsmith agent is not installed on the device. \
-                            Set agentApk and agentTestApk in your Tapsmith config, \
-                            or install manually with: adb install <path-to-agent.apk>"
-                            .to_string(),
-                        screenshot: Vec::new(),
-                    }));
-                }
-
-                // Always reinstall when APK paths are provided so that code
-                // changes to the agent are deployed without manual intervention.
-                if has_apk_paths {
-                    info!("Installing agent APKs...");
-                    if let Err(e) = adb::install_apk(&serial, &req.agent_apk_path, true).await {
-                        return Ok(Response::new(proto::ActionResponse {
-                            request_id,
-                            success: false,
-                            error_type: "AGENT_INSTALL_FAILED".to_string(),
-                            error_message: format!("Failed to install agent APK: {e}"),
-                            screenshot: Vec::new(),
-                        }));
-                    }
-                    if let Err(e) = adb::install_apk(&serial, &req.agent_test_apk_path, true).await
-                    {
-                        return Ok(Response::new(proto::ActionResponse {
-                            request_id,
-                            success: false,
-                            error_type: "AGENT_INSTALL_FAILED".to_string(),
-                            error_message: format!("Failed to install agent test APK: {e}"),
-                            screenshot: Vec::new(),
-                        }));
-                    }
-                    info!("Agent APKs installed successfully");
-                }
-
-                // Launch the agent instrumentation
-                agent_comms::clear_stream_cache(&self.agent_stream).await;
-                let instrument_cmd = if req.target_package.is_empty() {
-                    "am instrument -w dev.tapsmith.agent/.TapsmithAgent".to_string()
-                } else {
-                    format!(
-                        "am instrument -w -e targetPackage {} dev.tapsmith.agent/.TapsmithAgent",
-                        req.target_package
-                    )
-                };
-
-                // Launch in background on device, keeping the runner's output
-                // on the device for the failure diagnostics below.
-                let bg_cmd = format!("nohup {instrument_cmd} > {ANDROID_AGENT_LOG_PATH} 2>&1 &");
-                if let Err(e) = adb::shell(&serial, &bg_cmd).await {
-                    error!(error = %e, "Failed to start agent instrumentation");
-                    return Ok(Response::new(proto::ActionResponse {
-                        request_id,
-                        success: false,
-                        error_type: "AGENT_START_FAILED".to_string(),
-                        error_message: e.to_string(),
-                        screenshot: Vec::new(),
-                    }));
-                }
-            }
+        if let Err(resp) = backend
+            .launch_agent(request_id.clone(), serial.clone(), &req)
+            .await
+        {
+            return Ok(Response::new(resp));
         }
 
         // Connect to the agent (iOS: direct TCP, Android: via ADB port forward)
         let mut agent = self.agent.write().await;
-        let connect_result = match platform {
-            Platform::Ios => agent.connect_ios(&serial).await,
-            // The instrumentation was launched just above. Wait for it to
-            // actually answer: through the forwarded port a bare connect
-            // succeeds before (or without) the agent ever listening.
-            Platform::Android => {
-                agent
-                    .connect_android_with_readiness(&serial, ANDROID_AGENT_START_READINESS)
-                    .await
-            }
-        };
+        let connect_result = backend.connect_agent(&mut agent, &serial).await;
         match connect_result {
             Ok(()) => {
-                // Best-effort pre-warm of the app-container cache while
-                // CoreSimulator is (presumably) healthy: if it wedges later
-                // in the session, app-state save/clear fall back to this
-                // resolved path instead of failing on a timed-out lookup.
-                if platform == Platform::Ios
-                    && !self.is_active_ios_physical().await
-                    && !desired_agent_config.target_package.is_empty()
-                {
-                    let cache = self.ios_app_container_cache.clone();
-                    let serial_c = serial.clone();
-                    let pkg = desired_agent_config.target_package.clone();
-                    tokio::spawn(async move {
-                        if let Ok(path) = ios::device::get_app_container(&serial_c, &pkg).await {
-                            cache
-                                .write()
-                                .await
-                                .insert(format!("{serial_c}\u{0}{pkg}"), path);
-                        }
-                    });
-                }
-                // Resolve and cache the Android launcher activity now, while
-                // the device is calm, so every later clean-task relaunch (the
-                // restart/clear reset rungs) can discard saved instance state
-                // without depending on a `resolve-activity` call landing under
-                // load. `pm clear` wipes app data but NOT the ActivityManager
-                // task record, so a relaunch that can't clear the task brings
-                // back the old route and scroll position.
-                if matches!(self.require_platform().await, Ok(Platform::Android))
-                    && !desired_agent_config.target_package.is_empty()
-                {
-                    if let Ok(serial) = self.active_serial().await {
-                        let activity = self
-                            .resolve_launcher_activity(
-                                &serial,
-                                &desired_agent_config.target_package,
-                            )
-                            .await
-                            .ok()
-                            .flatten();
-                        *self.android_launcher_activity.write().await = activity;
-                    }
-                }
+                backend
+                    .after_agent_connected(&serial, &desired_agent_config.target_package)
+                    .await;
                 *self.started_agent_config.write().await = Some(desired_agent_config);
                 Ok(Self::success_action_response(request_id))
             }
@@ -3245,9 +3026,11 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
                 error!(error = %e, "Failed to connect to agent");
                 let platform = self.require_platform().await?;
                 let mut error_message = e.to_string();
-                if platform == Platform::Android {
-                    error_message.push_str(&android_agent_start_diagnostics(&serial).await);
-                }
+                error_message.push_str(
+                    &device_backend::for_platform(self, platform)
+                        .agent_start_diagnostics(&serial)
+                        .await,
+                );
                 let screenshot = screenshot::capture_for_error(Some(&serial), platform).await;
                 Ok(Response::new(proto::ActionResponse {
                     request_id,
