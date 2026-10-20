@@ -26,6 +26,12 @@ use crate::proto;
 use crate::route_handler::RouteInterceptHandler;
 use crate::screenshot;
 
+mod android_backend;
+mod device_backend;
+mod ios_backend;
+
+use device_backend::{DeviceBackend, PermissionChange};
+
 const ANDROID_PROXY_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const ANDROID_REVERSE_PORT_FALLBACK_BASE: u16 = 41_000;
 const ANDROID_REVERSE_PORT_FALLBACK_SPAN: u16 = 20_000;
@@ -1927,6 +1933,13 @@ impl TapsmithServiceImpl {
             .ok_or_else(|| Status::failed_precondition("No device selected. Call SetDevice first."))
     }
 
+    /// The active device's platform backend. Fails like [`Self::require_platform`]
+    /// when no device is selected.
+    async fn backend(&self) -> Result<Box<dyn DeviceBackend + '_>, Status> {
+        let platform = self.require_platform().await?;
+        Ok(device_backend::for_platform(self, platform))
+    }
+
     async fn error_screenshot(&self) -> Vec<u8> {
         let dm = self.device_manager.read().await;
         let serial = dm.active_serial().map(String::from);
@@ -2201,75 +2214,6 @@ impl TapsmithServiceImpl {
             error_message: String::new(),
             screenshot: Vec::new(),
         })
-    }
-
-    /// Helper for methods where iOS is a no-op (returns success) and Android
-    /// runs a single ADB shell command.
-    async fn ios_noop_or_android_adb(
-        &self,
-        request_id: String,
-        android_cmd: &str,
-    ) -> Result<Response<proto::ActionResponse>, Status> {
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => Ok(Self::success_action_response(request_id)),
-            Platform::Android => self.adb_action(request_id, android_cmd).await,
-        }
-    }
-
-    /// Helper for grant/revoke permission which share identical structure:
-    /// iOS calls `ios::device::{action}_permission`, Android validates the
-    /// permission format then runs `pm {action}`.
-    async fn platform_permission_action(
-        &self,
-        request_id: String,
-        package_name: &str,
-        permission: &str,
-        action: &str,
-    ) -> Result<Response<proto::ActionResponse>, Status> {
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                if self.is_active_ios_physical().await {
-                    // `xcrun simctl privacy` only targets simulators. Physical
-                    // devices require user interaction (or MDM) to change
-                    // permission state. Surface a clear error with a workaround
-                    // pointing to the in-app permission dialog + UIInterruptionMonitor.
-                    return Ok(self
-                        .action_error(
-                            request_id,
-                            "UNSUPPORTED_ON_PHYSICAL_DEVICE",
-                            format!(
-                                "device.{action}Permission is not supported on physical iOS devices. \
-                                 Workaround: trigger the in-app permission dialog during the test and \
-                                 let the XCUITest UIInterruptionMonitor tap through it automatically."
-                            ),
-                        )
-                        .await);
-                }
-                let serial = self.active_serial().await?;
-                let result = match action {
-                    "grant" => {
-                        ios::device::grant_permission(&serial, package_name, permission).await
-                    }
-                    "revoke" => {
-                        ios::device::revoke_permission(&serial, package_name, permission).await
-                    }
-                    _ => unreachable!("platform_permission_action called with invalid action"),
-                };
-                match result {
-                    Ok(()) => Ok(Self::success_action_response(request_id)),
-                    Err(e) => Ok(self
-                        .action_error(request_id, "ACTION_FAILED", e.to_string())
-                        .await),
-                }
-            }
-            Platform::Android => {
-                Self::validate_permission(permission)?;
-                let cmd = format!("pm {action} {package_name} {permission}");
-                self.adb_action(request_id, &cmd).await
-            }
-        }
     }
 
     async fn finish_launch(
@@ -4366,23 +4310,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        let package_name = match platform {
-            Platform::Ios => {
-                // On iOS, return the target package from agent config
-                self.ios_agent_config
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|c| c.target_package.clone())
-                    .unwrap_or_default()
-            }
-            Platform::Android => self
-                .get_current_component()
-                .await?
-                .map(|(pkg, _)| pkg)
-                .unwrap_or_default(),
-        };
+        let package_name = self.backend().await?.current_package().await?;
 
         Ok(Response::new(proto::GetCurrentPackageResponse {
             request_id,
@@ -4398,18 +4326,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        let activity = match platform {
-            Platform::Ios => {
-                // Android-only concept — iOS doesn't have activities
-                String::new()
-            }
-            Platform::Android => self
-                .get_current_component()
-                .await?
-                .map(|(_, act)| act)
-                .unwrap_or_default(),
-        };
+        let activity = self.backend().await?.current_activity().await?;
 
         Ok(Response::new(proto::GetCurrentActivityResponse {
             request_id,
@@ -4707,61 +4624,10 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         Self::validate_package_name(&req.package_name)?;
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                // Terminate through the XCUITest agent so the runner stays in
-                // sync with app state. This prevents the cascading fallback
-                // chain in reset_ios_app when the next test calls restartApp.
-                // Fall back to simctl terminate if the agent is unreachable.
-                let agent_result = self
-                    .send_agent_command_with_timeout(
-                        &AgentCommand::TerminateApp {
-                            package: req.package_name.clone(),
-                        },
-                        4_000,
-                    )
-                    .await;
-
-                // Fall back to simctl on transport error AND on agent-reported
-                // failure (Ok(resp) where !resp.success). The agent can return
-                // a structured failure (e.g. app already gone, XCUI error) that
-                // would otherwise be silently swallowed. Physical devices have
-                // no simctl fallback — if the agent fails, the app state is
-                // indeterminate and we surface the error rather than pretending
-                // it worked.
-                let needs_fallback = match &agent_result {
-                    Err(_) => true,
-                    Ok(resp) => !resp.success,
-                };
-                if needs_fallback {
-                    if self.is_active_ios_physical().await {
-                        let msg = match &agent_result {
-                            Err(status) => status.message().to_string(),
-                            Ok(resp) => resp
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "terminate_app agent path failed".to_string()),
-                        };
-                        return Ok(self.action_error(request_id, "TERMINATE_FAILED", msg).await);
-                    }
-                    let serial = self.active_serial().await?;
-                    let _ = ios::device::terminate_app(&serial, &req.package_name).await;
-                }
-
-                Ok(Response::new(proto::ActionResponse {
-                    request_id,
-                    success: true,
-                    error_type: String::new(),
-                    error_message: String::new(),
-                    screenshot: Vec::new(),
-                }))
-            }
-            Platform::Android => {
-                let cmd = format!("am force-stop {}", req.package_name);
-                self.adb_action(request_id, &cmd).await
-            }
-        }
+        self.backend()
+            .await?
+            .terminate_app(request_id, &req.package_name)
+            .await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -4774,73 +4640,11 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         Self::validate_package_name(&req.package_name)?;
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                // Route through the XCUITest agent which can query app state
-                let command = AgentCommand::GetAppState {
-                    package: req.package_name.clone(),
-                };
-                let result = self.send_agent_command(&command).await?;
-                let state = result
-                    .data
-                    .get("state")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("stopped")
-                    .to_string();
-                Ok(Response::new(proto::GetAppStateResponse {
-                    request_id,
-                    state,
-                }))
-            }
-            Platform::Android => {
-                let serial = self.active_serial().await?;
-
-                // Check if app is installed
-                let installed =
-                    adb::shell_lenient(&serial, &format!("pm list packages {}", req.package_name))
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
-
-                if !installed.contains(&req.package_name) {
-                    return Ok(Response::new(proto::GetAppStateResponse {
-                        request_id,
-                        state: "not_installed".to_string(),
-                    }));
-                }
-
-                // Check if app process is running and in foreground
-                let resumed = adb::shell_lenient(
-                    &serial,
-                    "dumpsys activity activities | grep -E 'mResumedActivity|ResumedActivity|topResumedActivity'",
-                )
-                .await
-                .map_err(|e| Status::internal(e.to_string()))?;
-
-                if resumed.contains(&req.package_name) {
-                    return Ok(Response::new(proto::GetAppStateResponse {
-                        request_id,
-                        state: "foreground".to_string(),
-                    }));
-                }
-
-                // Check if process exists at all
-                let procs = adb::shell_lenient(&serial, &format!("pidof {}", req.package_name))
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-
-                let state = if procs.trim().is_empty() {
-                    "stopped"
-                } else {
-                    "background"
-                };
-
-                Ok(Response::new(proto::GetAppStateResponse {
-                    request_id,
-                    state: state.to_string(),
-                }))
-            }
-        }
+        let state = self.backend().await?.app_state(&req.package_name).await?;
+        Ok(Response::new(proto::GetAppStateResponse {
+            request_id,
+            state,
+        }))
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -4985,7 +4789,14 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         Self::validate_package_name(&req.package_name)?;
 
         // iOS uses service names: camera, photos, location, microphone, etc.
-        self.platform_permission_action(request_id, &req.package_name, &req.permission, "grant")
+        self.backend()
+            .await?
+            .change_permission(
+                request_id,
+                &req.package_name,
+                &req.permission,
+                PermissionChange::Grant,
+            )
             .await
     }
 
@@ -4999,7 +4810,14 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         Self::validate_package_name(&req.package_name)?;
 
-        self.platform_permission_action(request_id, &req.package_name, &req.permission, "revoke")
+        self.backend()
+            .await?
+            .change_permission(
+                request_id,
+                &req.package_name,
+                &req.permission,
+                PermissionChange::Revoke,
+            )
             .await
     }
 
@@ -5010,62 +4828,11 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
     ) -> Result<Response<proto::ActionResponse>, Status> {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
-        let platform = self.require_platform().await?;
 
-        match platform {
-            Platform::Ios => {
-                if self.is_active_ios_physical().await {
-                    // simctl pbcopy is simulator-only. Physical devices go
-                    // through the XCUITest agent, which calls
-                    // `UIPasteboard.general.string = ...`. Writes don't
-                    // trigger the iOS 16+ paste prompt — only reads do, and
-                    // even then the runner bundle bypasses the dialog since
-                    // it isn't a foreground app.
-                    let command = AgentCommand::SetClipboard { text: req.text };
-                    let result = self.send_agent_command(&command).await;
-                    return self.make_action_response(request_id, result).await;
-                }
-                // Use simctl pbcopy to avoid the iOS 16+ paste permission dialog
-                // that would crash the XCUITest agent if it accessed UIPasteboard.
-                //
-                // pbcopy rides the sim's pasteboard-sync service, which wedges
-                // intermittently on CI — retry briefly, then fall back to the
-                // agent's `UIPasteboard.general.string = ...` (the physical-
-                // device path above): clipboard WRITES don't trigger the iOS
-                // 16+ paste prompt, so the fallback is prompt-safe on
-                // simulators too.
-                let serial = self.active_serial().await?;
-                let mut last_err: Option<anyhow::Error> = None;
-                for attempt in 0..3 {
-                    if attempt > 0 {
-                        tokio::time::sleep(Duration::from_millis(500)).await;
-                    }
-                    match ios::device::set_clipboard(&serial, &req.text).await {
-                        Ok(()) => return Ok(Self::success_action_response(request_id)),
-                        Err(e) => {
-                            warn!(%serial, attempt, error = %e, "simctl pbcopy failed");
-                            last_err = Some(e);
-                        }
-                    }
-                }
-                let pbcopy_err = last_err.expect("loop ran at least once");
-                info!(%serial, "Falling back to agent UIPasteboard write after pbcopy failures");
-                let command = AgentCommand::SetClipboard { text: req.text };
-                let result = self.send_agent_command(&command).await.map_err(|agent_err| {
-                    Status::internal(format!(
-                        "Failed to set clipboard on {serial}: {pbcopy_err} (agent fallback also failed: {agent_err})"
-                    ))
-                })?;
-                self.make_action_response(request_id, Ok(result)).await
-            }
-            Platform::Android => {
-                // Use the on-device agent for clipboard operations since it has
-                // access to Android's ClipboardManager via the instrumentation context.
-                let command = AgentCommand::SetClipboard { text: req.text };
-                let result = self.send_agent_command(&command).await;
-                self.make_action_response(request_id, result).await
-            }
-        }
+        self.backend()
+            .await?
+            .set_clipboard(request_id, req.text)
+            .await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5075,75 +4842,8 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
     ) -> Result<Response<proto::GetClipboardResponse>, Status> {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
-        let platform = self.require_platform().await?;
 
-        let text = match platform {
-            Platform::Ios => {
-                if self.is_active_ios_physical().await {
-                    // Route through the XCUITest agent — the runner bundle
-                    // can call `UIPasteboard.general.string` without hitting
-                    // the iOS 16+ paste prompt since it isn't a foreground
-                    // app. On simulators we keep the simctl pbpaste path to
-                    // match the existing behaviour (and avoid touching the
-                    // agent at all when we don't need to).
-                    let command = AgentCommand::GetClipboard {};
-                    let result = self
-                        .send_agent_command(&command)
-                        .await
-                        .map_err(|e| Status::internal(e.to_string()))?;
-                    result
-                        .data
-                        .get("text")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
-                } else {
-                    // Use simctl pbpaste to avoid the iOS 16+ paste permission dialog
-                    // that would crash the XCUITest agent if it accessed UIPasteboard.
-                    // Same bounded retry as set_clipboard — the sim's
-                    // pasteboard-sync service wedges intermittently on CI.
-                    let serial = self.active_serial().await?;
-                    let mut text = None;
-                    let mut last_err = None;
-                    for attempt in 0..3 {
-                        if attempt > 0 {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                        }
-                        match ios::device::get_clipboard(&serial).await {
-                            Ok(t) => {
-                                text = Some(t);
-                                break;
-                            }
-                            Err(e) => {
-                                warn!(%serial, attempt, error = %e, "simctl pbpaste failed");
-                                last_err = Some(e);
-                            }
-                        }
-                    }
-                    match text {
-                        Some(t) => t,
-                        None => {
-                            return Err(Status::internal(
-                                last_err.expect("loop ran at least once").to_string(),
-                            ))
-                        }
-                    }
-                }
-            }
-            Platform::Android => {
-                let command = AgentCommand::GetClipboard {};
-                let result = self
-                    .send_agent_command(&command)
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                result
-                    .data
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string()
-            }
-        };
+        let text = self.backend().await?.get_clipboard().await?;
 
         Ok(Response::new(proto::GetClipboardResponse {
             request_id,
@@ -5159,35 +4859,10 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                let command = AgentCommand::SetOrientation {
-                    orientation: req.orientation.clone(),
-                };
-                let result = self.send_agent_command(&command).await;
-                self.make_action_response(request_id, result).await
-            }
-            Platform::Android => {
-                let serial = self.active_serial().await?;
-                let rotation = match req.orientation.as_str() {
-                    "portrait" => "0",
-                    "landscape" => "1",
-                    other => {
-                        return Err(Status::invalid_argument(format!(
-                            "orientation must be 'portrait' or 'landscape', got '{other}'"
-                        )));
-                    }
-                };
-                if let Err(e) =
-                    adb::shell(&serial, "settings put system accelerometer_rotation 0").await
-                {
-                    error!(error = %e, "Failed to disable auto-rotate");
-                }
-                let cmd = format!("settings put system user_rotation {rotation}");
-                self.adb_action(request_id, &cmd).await
-            }
-        }
+        self.backend()
+            .await?
+            .set_orientation(request_id, &req.orientation)
+            .await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5198,37 +4873,11 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                let command = AgentCommand::GetOrientation {};
-                let result = self.send_agent_command(&command).await?;
-                let orientation = result
-                    .data
-                    .get("orientation")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("portrait")
-                    .to_string();
-                Ok(Response::new(proto::GetOrientationResponse {
-                    request_id,
-                    orientation,
-                }))
-            }
-            Platform::Android => {
-                let serial = self.active_serial().await?;
-                let output = adb::shell(&serial, "settings get system user_rotation")
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                let orientation = match output.trim() {
-                    "1" | "3" => "landscape",
-                    _ => "portrait",
-                };
-                Ok(Response::new(proto::GetOrientationResponse {
-                    request_id,
-                    orientation: orientation.to_string(),
-                }))
-            }
-        }
+        let orientation = self.backend().await?.get_orientation().await?;
+        Ok(Response::new(proto::GetOrientationResponse {
+            request_id,
+            orientation,
+        }))
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5239,30 +4888,11 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                let command = AgentCommand::IsKeyboardShown {};
-                let result = self.send_agent_command(&command).await?;
-                let shown = result
-                    .data
-                    .get("shown")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                Ok(Response::new(proto::IsKeyboardShownResponse {
-                    request_id,
-                    shown,
-                }))
-            }
-            Platform::Android => {
-                let serial = self.active_serial().await?;
-                let shown = self.android_is_keyboard_shown(&serial).await?;
-                Ok(Response::new(proto::IsKeyboardShownResponse {
-                    request_id,
-                    shown,
-                }))
-            }
-        }
+        let shown = self.backend().await?.is_keyboard_shown().await?;
+        Ok(Response::new(proto::IsKeyboardShownResponse {
+            request_id,
+            shown,
+        }))
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5273,29 +4903,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                let result = self
-                    .send_agent_command(&AgentCommand::HideKeyboard {})
-                    .await;
-                self.make_action_response(request_id, result).await
-            }
-            Platform::Android => {
-                // The Android soft keyboard is dismissed by BACK, not ESCAPE —
-                // KEYCODE_ESCAPE is a no-op for the IME on most apps (incl.
-                // Flutter). Only send BACK when the keyboard is actually shown,
-                // otherwise BACK would pop the current screen / background the app.
-                let serial = self.active_serial().await?;
-                let shown = self.android_is_keyboard_shown(&serial).await?;
-                if shown {
-                    self.adb_action(request_id, "input keyevent KEYCODE_BACK")
-                        .await
-                } else {
-                    Ok(Self::success_action_response(request_id))
-                }
-            }
-        }
+        self.backend().await?.hide_keyboard(request_id).await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5306,9 +4914,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        // iOS has no notification shade — success no-op
-        self.ios_noop_or_android_adb(request_id, "cmd statusbar expand-notifications")
-            .await
+        self.backend().await?.open_notifications(request_id).await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5319,9 +4925,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        // iOS has no quick settings — success no-op
-        self.ios_noop_or_android_adb(request_id, "cmd statusbar expand-settings")
-            .await
+        self.backend().await?.open_quick_settings(request_id).await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5332,54 +4936,10 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                match req.scheme.as_str() {
-                    "dark" | "light" => {}
-                    other => {
-                        return Err(Status::invalid_argument(format!(
-                            "scheme must be 'dark' or 'light', got '{other}'"
-                        )));
-                    }
-                }
-                if self.is_active_ios_physical().await {
-                    // `xcrun simctl ui appearance` is simulator-only. Physical
-                    // devices require the user to toggle light/dark mode in
-                    // Settings; there is no programmatic path.
-                    return Ok(self
-                        .action_error(
-                            request_id,
-                            "UNSUPPORTED_ON_PHYSICAL_DEVICE",
-                            "device.setColorScheme is not supported on physical iOS devices. \
-                             Workaround: set the system appearance on the device manually \
-                             (Settings → Display & Brightness) before running the test."
-                                .to_string(),
-                        )
-                        .await);
-                }
-                let serial = self.active_serial().await?;
-                match ios::device::set_appearance(&serial, &req.scheme).await {
-                    Ok(()) => Ok(Self::success_action_response(request_id)),
-                    Err(e) => Ok(self
-                        .action_error(request_id, "ACTION_FAILED", e.to_string())
-                        .await),
-                }
-            }
-            Platform::Android => {
-                let mode = match req.scheme.as_str() {
-                    "dark" => "yes",
-                    "light" => "no",
-                    other => {
-                        return Err(Status::invalid_argument(format!(
-                            "scheme must be 'dark' or 'light', got '{other}'"
-                        )));
-                    }
-                };
-                let cmd = format!("cmd uimode night {mode}");
-                self.adb_action(request_id, &cmd).await
-            }
-        }
+        self.backend()
+            .await?
+            .set_color_scheme(request_id, &req.scheme)
+            .await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5390,39 +4950,11 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                // Route through agent — it can read UITraitCollection.current
-                let command = AgentCommand::GetColorScheme {};
-                let result = self.send_agent_command(&command).await?;
-                let scheme = result
-                    .data
-                    .get("scheme")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("light")
-                    .to_string();
-                Ok(Response::new(proto::GetColorSchemeResponse {
-                    request_id,
-                    scheme,
-                }))
-            }
-            Platform::Android => {
-                let serial = self.active_serial().await?;
-                let output = adb::shell_lenient(&serial, "cmd uimode night")
-                    .await
-                    .map_err(|e| Status::internal(e.to_string()))?;
-                let scheme = if output.contains("Night mode: yes") {
-                    "dark"
-                } else {
-                    "light"
-                };
-                Ok(Response::new(proto::GetColorSchemeResponse {
-                    request_id,
-                    scheme: scheme.to_string(),
-                }))
-            }
-        }
+        let scheme = self.backend().await?.get_color_scheme().await?;
+        Ok(Response::new(proto::GetColorSchemeResponse {
+            request_id,
+            scheme,
+        }))
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5433,9 +4965,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        // iOS simulator is always awake
-        self.ios_noop_or_android_adb(request_id, "input keyevent KEYCODE_WAKEUP")
-            .await
+        self.backend().await?.wake(request_id).await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -5446,44 +4976,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
-        match platform {
-            // iOS simulator has no lock screen
-            Platform::Ios => Ok(Self::success_action_response(request_id)),
-            Platform::Android => {
-                let serial = self.active_serial().await?;
-                // Wake the screen first
-                let _ = adb::shell_lenient(&serial, "input keyevent KEYCODE_WAKEUP").await;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                // Only dismiss a keyguard that is actually showing. The
-                // legacy sequence below is a MENU key plus a swipe up, and
-                // on an already-unlocked device both land on the foreground
-                // app — the swipe scrolls its root list to the bottom. UI
-                // mode unlocks right before running a file whose reset the
-                // background preparation already satisfied, so nothing
-                // undoes that scroll and the first assertions fail on a
-                // "prepared" device (headless survived only because its
-                // inline reset runs after the unlock).
-                if adb::keyguard_showing(&serial).await == Some(false) {
-                    return Ok(Self::success_action_response(request_id));
-                }
-                // `wm dismiss-keyguard` is the input-free path (API 26+). It
-                // does nothing for secure keyguards, so re-check and fall
-                // back to the gesture only while the lock screen is still up
-                // (or when the dump cannot tell).
-                let _ = adb::shell_lenient(&serial, "wm dismiss-keyguard").await;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                if adb::keyguard_showing(&serial).await == Some(false) {
-                    return Ok(Self::success_action_response(request_id));
-                }
-                // Dismiss non-secure lock screen (KEYCODE_MENU)
-                let _ = adb::shell_lenient(&serial, "input keyevent 82").await;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                // Swipe up as fallback for swipe-to-unlock screens
-                let _ = adb::shell_lenient(&serial, "input swipe 540 1800 540 800 300").await;
-                Ok(Self::success_action_response(request_id))
-            }
-        }
+        self.backend().await?.unlock(request_id).await
     }
 
     // ─── Network Capture (PILOT-164) ───
