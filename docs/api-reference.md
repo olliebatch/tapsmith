@@ -3473,3 +3473,24 @@ Tapsmith includes a built-in MCP server that lets AI coding agents interact with
 - **Stdio mode** (client-launched `tapsmith mcp-server`) -- standalone agent with its own headless test session, daemon, and device. Includes test discovery, results, watch mode, stop, and session info. 16 tools available.
 
 See the [MCP Server Guide](mcp-server.md) for setup instructions, the full tool reference, and the recommended workflow.
+
+## ESLint Plugin
+
+### `eslintPlugin`
+
+```typescript
+import { eslintPlugin } from "tapsmith"
+```
+
+An ESLint plugin with four rules: `prefer-role`, `no-bare-locator-xpath`, `prefer-accessible-locators` and `prefer-app-reset-option`. The [Locators Guide](locators.md#eslint-plugin) describes each rule and has the setup for a TypeScript project.
+
+### `eslintPlugin.configs.recommended`
+
+A flat config object. List it in `extends` next to your own `files`, as the [Locators Guide](locators.md#eslint-plugin) setup does. It contains:
+
+- `name`: `"tapsmith/recommended"`
+- `files`: every JavaScript and TypeScript extension (`**/*.{js,mjs,cjs,jsx,ts,mts,cts,tsx}`). In `extends`, ESLint combines this with your own `files`, so your `files` decides which files are linted. If you add the config directly to the config array instead, it applies to every file in the project, including app code and unit tests that call Testing Library's `getByTestId()`.
+- `plugins`: `{ tapsmith: eslintPlugin }`
+- `rules`: each rule at its default level (`no-bare-locator-xpath` is an error, the other three are warnings)
+
+The config does not set a parser. To lint TypeScript, add one, for example `tseslint.configs.base` from `typescript-eslint`.
