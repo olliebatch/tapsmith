@@ -519,4 +519,427 @@ impl DeviceBackend for AndroidBackend<'_> {
     async fn supports_cold_deep_link(&self) -> bool {
         false
     }
+
+    async fn save_app_state(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::SaveAppStateRequest,
+    ) -> ActionResult {
+        let pkg = &req.package_name;
+        let local_path = &req.path;
+
+        let device_tmp = format!(
+            "/data/local/tmp/tapsmith-app-state-{}.tar.gz",
+            Uuid::new_v4()
+        );
+        let data_dir = format!("/data/data/{pkg}");
+        let tar_timeout = Duration::from_secs(300);
+
+        // 1. Force-stop the app to avoid data corruption
+        if let Err(e) = adb::shell(&serial, &format!("am force-stop {pkg}")).await {
+            warn!(%pkg, "Failed to force-stop app before save: {e}");
+        }
+
+        // 2. Determine access strategy: root or run-as
+        let is_root = adb::shell_lenient(&serial, "id")
+            .await
+            .map(|out| out.contains("uid=0"))
+            .unwrap_or(false);
+
+        // 2b. Capture device-side state that lives OUTSIDE /data/data and
+        // is destroyed by `pm clear` (root only), embedding each as a
+        // reserved member written into the data dir so the tar below
+        // picks it up and restore can re-establish it:
+        //  - AndroidKeyStore keys: Firebase et al. encrypt data-dir
+        //    credentials with a keystore key the data tar can't carry.
+        //  - Granted runtime permissions (e.g. POST_NOTIFICATIONS): so a
+        //    prompt dismissed once stays dismissed across restore.
+        // Best-effort: capture never fails the save. The guard removes
+        // the members from the live data dir once it drops — after the
+        // tar below has captured them, or on cancellation — so they never
+        // linger inside the app's files.
+        let mut injected_members = adb::DeviceFileGuard::new(serial.clone());
+        if is_root {
+            match android_keystore::capture_into_data_dir(&serial, pkg, &data_dir).await {
+                Ok(true) => injected_members.track(format!(
+                    "{data_dir}/{}",
+                    android_keystore::KEYSTORE_ARCHIVE_MEMBER
+                )),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(%pkg, error = %e, "Keystore capture failed; archive will not include keystore state");
+                }
+            }
+            match android_permissions::capture_into_data_dir(&serial, pkg, &data_dir).await {
+                Ok(true) => injected_members.track(format!(
+                    "{data_dir}/{}",
+                    android_permissions::PERMISSIONS_ARCHIVE_MEMBER
+                )),
+                Ok(false) => {}
+                Err(e) => {
+                    warn!(%pkg, error = %e, "Runtime permission capture failed; archive will not include permission state");
+                }
+            }
+        }
+
+        // 3. Create tar.gz archive on device, excluding cache
+        // directories that don't carry meaningful app state.
+        // Older Toybox builds (pre-Android 10) lack --exclude, so
+        // fall back to archiving everything if the first attempt fails.
+        let tar_cmd = |excludes: &str| {
+            let prefix = if is_root {
+                String::new()
+            } else {
+                format!("run-as {pkg} ")
+            };
+            if excludes.is_empty() {
+                format!("{prefix}tar czf {device_tmp} -C {data_dir} .")
+            } else {
+                format!("{prefix}tar czf {device_tmp} {excludes} -C {data_dir} .")
+            }
+        };
+        let tar_result = adb::shell_with_timeout(
+            &serial,
+            &tar_cmd("--exclude=./cache --exclude=./code_cache"),
+            tar_timeout,
+        )
+        .await;
+        let tar_result = match tar_result {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                debug!("tar with --exclude failed, retrying without exclusions");
+                let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+                adb::shell_with_timeout(&serial, &tar_cmd(""), tar_timeout)
+                    .await
+                    .map(|_| ())
+            }
+        };
+
+        // The reserved members are now inside the archive; `injected_members`
+        // (a DeviceFileGuard) removes them from the live data dir when it
+        // drops at the end of this handler, on every exit path.
+
+        if let Err(e) = tar_result {
+            let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+            return Ok(self
+                .svc
+                .action_error(
+                    request_id,
+                    "APP_STATE_SAVE_FAILED",
+                    format!("Failed to archive app data: {e}"),
+                )
+                .await);
+        }
+
+        // 4. Pull archive to host
+        if let Some(parent) = std::path::Path::new(local_path).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        if let Err(e) = adb::pull_file(&serial, &device_tmp, local_path).await {
+            let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+            return Ok(self
+                .svc
+                .action_error(
+                    request_id,
+                    "APP_STATE_SAVE_FAILED",
+                    format!("Failed to pull app state archive: {e}"),
+                )
+                .await);
+        }
+
+        // 5. Clean up temp file on device
+        let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+
+        info!(%pkg, %local_path, "App state saved");
+        Ok(TapsmithServiceImpl::success_action_response(request_id))
+    }
+
+    async fn restore_app_state(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::RestoreAppStateRequest,
+    ) -> ActionResult {
+        let pkg = &req.package_name;
+        let local_path = &req.path;
+
+        let device_tmp = format!(
+            "/data/local/tmp/tapsmith-app-state-{}.tar.gz",
+            Uuid::new_v4()
+        );
+        let data_dir = format!("/data/data/{pkg}");
+        let tar_timeout = Duration::from_secs(300);
+
+        // 1. Force-stop the app
+        if let Err(e) = adb::shell(&serial, &format!("am force-stop {pkg}")).await {
+            warn!(%pkg, "Failed to force-stop app before restore: {e}");
+        }
+
+        // 2. Determine access strategy: root or run-as.
+        let is_root = adb::shell_lenient(&serial, "id")
+            .await
+            .map(|out| out.contains("uid=0"))
+            .unwrap_or(false);
+
+        // 3. Clear the app's data dir IN PLACE, preserving the device
+        // keystore. `pm clear` would also wipe the app's AndroidKeyStore
+        // keys — and on Android those keys hold the decryption key for
+        // credentials persisted *inside* the data dir (e.g. Firebase
+        // Auth encrypts its session token with a Tink keyset that is
+        // itself wrapped by an AndroidKeyStore master key). Wiping the
+        // keystore leaves the restored, still-encrypted credentials
+        // undecryptable, so the app comes back signed out. Removing only
+        // the data-dir contents keeps the keystore intact. The `lib`
+        // entry (symlink to the installed native libraries) is left in
+        // place. Restored files get their ownership/SELinux context
+        // fixed below (root) or inherit the run-as app identity.
+        let clear_cmd = {
+            // `-exec ... \;` (one `rm` per entry) rather than `+`: with
+            // `+`, a `find` that matches nothing can invoke `rm` with no
+            // operands on some implementations, which errors. `\;` only
+            // runs `rm` per match, so an empty/lib-only dir is a no-op.
+            let find = format!(
+                "find {data_dir} -mindepth 1 -maxdepth 1 ! -name lib -exec rm -rf {{}} \\;"
+            );
+            if is_root {
+                find
+            } else {
+                format!("run-as {pkg} {find}")
+            }
+        };
+        if let Err(e) = adb::shell(&serial, &clear_cmd).await {
+            return Ok(self
+                .svc
+                .action_error(
+                    request_id,
+                    "APP_STATE_RESTORE_FAILED",
+                    format!("Failed to clear app data: {e}"),
+                )
+                .await);
+        }
+
+        // 4. Push archive to device
+        if let Err(e) = adb::push_file(&serial, local_path, &device_tmp).await {
+            let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+            return Ok(self
+                .svc
+                .action_error(
+                    request_id,
+                    "APP_STATE_RESTORE_FAILED",
+                    format!("Failed to push app state archive: {e}"),
+                )
+                .await);
+        }
+
+        // 5. Extract archive into app data dir
+        let tar_result = if is_root {
+            adb::shell_with_timeout(
+                &serial,
+                &format!("tar xzf {device_tmp} -C {data_dir}"),
+                tar_timeout,
+            )
+            .await
+        } else {
+            adb::shell_with_timeout(
+                &serial,
+                &format!("run-as {pkg} tar xzf {device_tmp} -C {data_dir}"),
+                tar_timeout,
+            )
+            .await
+        };
+
+        if let Err(e) = tar_result {
+            let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+            return Ok(self
+                .svc
+                .action_error(
+                    request_id,
+                    "APP_STATE_RESTORE_FAILED",
+                    format!("Failed to extract app state archive: {e}"),
+                )
+                .await);
+        }
+
+        // 6. Fix ownership and SELinux context (root only)
+        if is_root {
+            let uid_output =
+                match adb::shell_lenient(&serial, &format!("stat -c '%u' {data_dir}")).await {
+                    Ok(output) => output,
+                    Err(e) => {
+                        let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+                        return Ok(self
+                            .svc
+                            .action_error(
+                                request_id,
+                                "APP_STATE_RESTORE_FAILED",
+                                format!("Failed to determine app UID via stat: {e}"),
+                            )
+                            .await);
+                    }
+                };
+            let uid = uid_output.trim().to_string();
+
+            if uid.is_empty() {
+                let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        "Failed to determine app UID: stat returned empty output".to_string(),
+                    )
+                    .await);
+            }
+
+            if let Err(e) = adb::shell_with_timeout(
+                &serial,
+                &format!("chown -R {uid}:{uid} {data_dir}"),
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("Failed to fix ownership on restored app state: {e}"),
+                    )
+                    .await);
+            }
+
+            if let Err(e) = adb::shell_with_timeout(
+                &serial,
+                &format!("restorecon -R {data_dir}"),
+                Duration::from_secs(60),
+            )
+            .await
+            {
+                let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("Failed to fix SELinux context on restored app state: {e}"),
+                    )
+                    .await);
+            }
+        }
+
+        // 7. Clean up temp file
+        let _ = adb::shell_lenient(&serial, &format!("rm -f {device_tmp}")).await;
+
+        // 8. Re-establish device-side state captured outside /data/data
+        // (root only), if the archive carried it.
+        if is_root {
+            // Keystore keys: without these, credentials encrypted by a
+            // keystore key destroyed by a `pm clear` between save and
+            // restore (e.g. a sibling login project resetting the app)
+            // can't be decrypted and the app comes back signed out.
+            if let Err(e) = android_keystore::restore_from_data_dir(&serial, pkg, &data_dir).await {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("Keystore restore failed: {e}"),
+                    )
+                    .await);
+            }
+            // Granted runtime permissions: re-grant what was granted at
+            // save time so a dismissed prompt (e.g. notifications) stays
+            // dismissed. Best-effort — a stale permission must not fail
+            // the whole restore.
+            if let Err(e) =
+                android_permissions::restore_from_data_dir(&serial, pkg, &data_dir).await
+            {
+                warn!(%pkg, error = %e, "Runtime permission restore failed; app may re-prompt");
+            }
+        }
+
+        info!(%pkg, %local_path, "App state restored");
+        Ok(TapsmithServiceImpl::success_action_response(request_id))
+    }
+
+    async fn list_web_views(
+        &self,
+        request_id: String,
+        serial: String,
+    ) -> Result<Response<proto::ListWebViewsResponse>, Status> {
+        match adb::list_webview_sockets(&serial).await {
+            Ok(sockets) => {
+                let webviews = sockets
+                    .into_iter()
+                    .map(|s| proto::WebViewInfo {
+                        socket_name: s.socket_name,
+                        pid: s.pid,
+                        package_name: s.package_name,
+                        url: String::new(),
+                        title: String::new(),
+                    })
+                    .collect();
+                Ok(Response::new(proto::ListWebViewsResponse {
+                    request_id,
+                    webviews,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(proto::ListWebViewsResponse {
+                request_id,
+                webviews: Vec::new(),
+                error_message: format!(
+                    "Failed to discover WebViews: {e}. Ensure the app has \
+                             WebView.setWebContentsDebuggingEnabled(true) set."
+                ),
+            })),
+        }
+    }
+
+    async fn forward_web_view_port(
+        &self,
+        request_id: String,
+        serial: String,
+        req: proto::ForwardWebViewPortRequest,
+    ) -> Result<Response<proto::ForwardWebViewPortResponse>, Status> {
+        // Find a free port by binding to :0
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .map_err(|e| Status::internal(format!("Failed to find free port: {e}")))?;
+        let host_port = listener
+            .local_addr()
+            .map_err(|e| Status::internal(format!("Failed to get port: {e}")))?
+            .port();
+        drop(listener);
+
+        match adb::forward_abstract_socket_with_timeout(
+            &serial,
+            host_port,
+            &req.socket_name,
+            WEBVIEW_ADB_TIMEOUT,
+        )
+        .await
+        {
+            Ok(()) => {
+                self.svc
+                    .webview_forwards
+                    .write()
+                    .await
+                    .insert(host_port, req.socket_name);
+                Ok(Response::new(proto::ForwardWebViewPortResponse {
+                    request_id,
+                    success: true,
+                    local_port: host_port as u32,
+                    error_message: String::new(),
+                }))
+            }
+            Err(e) => Ok(Response::new(proto::ForwardWebViewPortResponse {
+                request_id,
+                success: false,
+                local_port: 0,
+                error_message: format!("Failed to forward WebView port: {e}"),
+            })),
+        }
+    }
 }

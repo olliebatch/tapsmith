@@ -936,4 +936,569 @@ impl DeviceBackend for IosBackend<'_> {
     async fn supports_cold_deep_link(&self) -> bool {
         !self.svc.is_active_ios_physical().await
     }
+
+    async fn save_app_state(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::SaveAppStateRequest,
+    ) -> ActionResult {
+        let pkg = &req.package_name;
+        let local_path = &req.path;
+
+        if self.svc.is_active_ios_physical().await {
+            // Physical devices: use `xcrun devicectl device copy from
+            // --domain-type appDataContainer` to pull the app's data
+            // container to a scratch directory, then tar it for
+            // parity with the simulator output shape.
+            warn!(
+                %pkg,
+                "Keychain state is not captured on physical iOS devices — keychain-backed data (e.g. native auth SDK credentials) will not be saved"
+            );
+            let scratch =
+                tempfile::tempdir().map_err(|e| Status::internal(format!("tempdir: {e}")))?;
+            let scratch_path = scratch.path().to_string_lossy().to_string();
+            if let Err(e) =
+                ios::device::copy_app_container_from_device(&serial, pkg, &scratch_path).await
+            {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_SAVE_FAILED",
+                        format!("devicectl copy from failed: {e}"),
+                    )
+                    .await);
+            }
+            if let Some(parent) = std::path::Path::new(local_path).parent() {
+                let _ = tokio::fs::create_dir_all(parent).await;
+            }
+            let output = tokio::process::Command::new("tar")
+                .args([
+                    "czf",
+                    local_path,
+                    "--exclude=./Library/Caches",
+                    "--exclude=./Library/WebKit",
+                    "--exclude=./Library/SplashBoard",
+                    "--exclude=./Library/Saved Application State",
+                    "--exclude=./tmp",
+                    "-C",
+                    &scratch_path,
+                    ".",
+                ])
+                .output()
+                .await;
+            return match output {
+                Ok(out) if out.status.success() => {
+                    info!(%pkg, %local_path, "iOS physical app state saved");
+                    Ok(TapsmithServiceImpl::success_action_response(request_id))
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    Ok(self
+                        .svc
+                        .action_error(
+                            request_id,
+                            "APP_STATE_SAVE_FAILED",
+                            format!("tar failed: {stderr}"),
+                        )
+                        .await)
+                }
+                Err(e) => Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_SAVE_FAILED",
+                        format!("Failed to run tar: {e}"),
+                    )
+                    .await),
+            };
+        }
+        // iOS simulator: app container is on the host filesystem.
+        // Use simctl to find it, then tar it directly.
+        let container = match self.svc.get_app_container_cached(&serial, pkg).await {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_SAVE_FAILED",
+                        format!("Failed to locate app container: {e}"),
+                    )
+                    .await);
+            }
+        };
+
+        // Terminate the app to flush data
+        let _ = ios::device::terminate_app(&serial, pkg).await;
+
+        // Stage the simulator's device-level keychain db so the
+        // archive captures keychain-backed state (Firebase Auth and
+        // other SDKs persist credentials there, outside the app
+        // container). Staging failures are non-fatal: the archive is
+        // still valid, just without keychain state.
+        let keychain_staging =
+            tempfile::tempdir().map_err(|e| Status::internal(format!("tempdir: {e}")))?;
+        let mut keychain_staged = 0;
+        if !ios::device::keychain_state_disabled() {
+            match ios::device::simulator_keychain_dir(&container) {
+                Some(keychain_dir) => {
+                    let dest = keychain_staging
+                        .path()
+                        .join(ios::device::KEYCHAIN_ARCHIVE_MEMBER);
+                    match ios::device::stage_keychain_files(&keychain_dir, &dest).await {
+                        Ok(count) => keychain_staged = count,
+                        Err(e) => {
+                            warn!(%pkg, error = %e, "Failed to stage simulator keychain; archive will not include keychain state");
+                        }
+                    }
+                }
+                None => {
+                    warn!(%pkg, container, "Could not derive simulator keychain dir; archive will not include keychain state");
+                }
+            }
+        }
+
+        // Create tar.gz archive of the data container, excluding
+        // caches and ephemeral data that inflates the archive
+        // without contributing to app state (auth tokens, prefs,
+        // databases). A React Native app container can have tens
+        // of MB in Library/Caches and Library/WebKit alone.
+        if let Some(parent) = std::path::Path::new(local_path).parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let mut tar_args: Vec<String> = vec![
+            "czf".into(),
+            local_path.clone(),
+            "--exclude=./Library/Caches".into(),
+            "--exclude=./Library/WebKit".into(),
+            "--exclude=./Library/SplashBoard".into(),
+            "--exclude=./Library/Saved Application State".into(),
+            "--exclude=./tmp".into(),
+            "-C".into(),
+            container.clone(),
+            ".".into(),
+        ];
+        if keychain_staged > 0 {
+            // Second -C pair appends the staged keychain as a
+            // reserved member alongside the container contents.
+            tar_args.extend([
+                "-C".into(),
+                keychain_staging.path().to_string_lossy().to_string(),
+                format!("./{}", ios::device::KEYCHAIN_ARCHIVE_MEMBER),
+            ]);
+        }
+        let output = tokio::process::Command::new("tar")
+            .args(&tar_args)
+            .output()
+            .await;
+
+        match output {
+            Ok(out) if out.status.success() => {
+                info!(%pkg, %local_path, "iOS app state saved");
+                Ok(TapsmithServiceImpl::success_action_response(request_id))
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_SAVE_FAILED",
+                        format!("tar failed: {stderr}"),
+                    )
+                    .await)
+            }
+            Err(e) => Ok(self
+                .svc
+                .action_error(
+                    request_id,
+                    "APP_STATE_SAVE_FAILED",
+                    format!("Failed to run tar: {e}"),
+                )
+                .await),
+        }
+    }
+
+    async fn restore_app_state(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::RestoreAppStateRequest,
+    ) -> ActionResult {
+        let pkg = &req.package_name;
+        let local_path = &req.path;
+
+        if self.svc.is_active_ios_physical().await {
+            // Physical: extract the archive locally, then push each
+            // top-level child (`Documents`, `Library`, `tmp`) back
+            // into the app container via `devicectl device copy to
+            // --remove-existing-content true`. We terminate the app
+            // first so iOS isn't actively writing to the directories
+            // we're overwriting.
+            let scratch =
+                tempfile::tempdir().map_err(|e| Status::internal(format!("tempdir: {e}")))?;
+            let scratch_path = scratch.path().to_string_lossy().to_string();
+            let extract = tokio::process::Command::new("tar")
+                .args(["xzf", local_path, "-C", &scratch_path])
+                .output()
+                .await;
+            match extract {
+                Ok(out) if !out.status.success() => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    return Ok(self
+                        .svc
+                        .action_error(
+                            request_id,
+                            "APP_STATE_RESTORE_FAILED",
+                            format!("tar extract failed: {stderr}"),
+                        )
+                        .await);
+                }
+                Err(e) => {
+                    return Ok(self
+                        .svc
+                        .action_error(
+                            request_id,
+                            "APP_STATE_RESTORE_FAILED",
+                            format!("Failed to run tar: {e}"),
+                        )
+                        .await);
+                }
+                _ => {}
+            }
+            // Collect top-level children that actually exist in the
+            // archive — we only want to push directories the user
+            // actually saved, so empty runs don't wipe the live data.
+            let mut sources: Vec<String> = Vec::new();
+            for name in ["Documents", "Library", "tmp"] {
+                let candidate = std::path::Path::new(&scratch_path).join(name);
+                if candidate.exists() {
+                    sources.push(candidate.to_string_lossy().to_string());
+                }
+            }
+            if sources.is_empty() {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        "Archive contained no Documents/Library/tmp directories".to_string(),
+                    )
+                    .await);
+            }
+            // Wipe the container by uninstalling + reinstalling the
+            // app. `devicectl copy to --remove-existing-content`
+            // alone would leave the app running and racing with
+            // our writes; wiping via reinstall is the same pattern
+            // we use for `clearAppData` and avoids every possible
+            // "process is holding files" edge case. After the
+            // reinstall the container is empty, so the subsequent
+            // copy just lays the saved state on top.
+            let app_path = self
+                .svc
+                .ios_agent_config
+                .read()
+                .await
+                .as_ref()
+                .and_then(|c| c.app_path.clone());
+            let Some(app_path) = app_path else {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        "device.restoreAppState on a physical iOS device requires \
+                                 the app bundle path cached at startAgent time. Tapsmith's \
+                                 CLI passes this automatically when `app` is set."
+                            .to_string(),
+                    )
+                    .await);
+            };
+            if let Err(e) = ios::device::uninstall_app_on_device(&serial, pkg).await {
+                warn!(error = %e, "Pre-restore uninstall failed, continuing");
+            }
+            if let Err(e) = ios::device::install_app_on_device(&serial, &app_path).await {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("Pre-restore reinstall failed: {e}"),
+                    )
+                    .await);
+            }
+            // Give LaunchServices a moment to re-register the
+            // freshly installed bundle before devicectl re-enters
+            // its sandbox to push the container contents.
+            tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
+            if let Err(e) = ios::device::copy_app_container_to_device(&serial, pkg, &sources).await
+            {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("devicectl copy to failed: {e}"),
+                    )
+                    .await);
+            }
+            info!(%pkg, %local_path, "iOS physical app state restored");
+            // Reinstalling + pushing the container replaces the app
+            // bundle under the running XCUITest runner. The agent's
+            // cached XCUIApplication references become stale in a
+            // way that causes snapshots to return partial trees
+            // after the next launch — elements present in the
+            // hierarchy dump are missing from findElement. Restart
+            // the agent entirely so the new test session starts
+            // against fresh XCUITest bindings.
+            if let Err(e) = self
+                .svc
+                .restart_ios_agent_for_app(&serial, pkg, false, 10_000)
+                .await
+            {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("Agent restart after restore failed: {e}"),
+                    )
+                    .await);
+            }
+            return Ok(TapsmithServiceImpl::success_action_response(request_id));
+        }
+        // iOS simulator: terminate the app, clear the data container,
+        // then extract the saved archive.
+        let _ = ios::device::terminate_app(&serial, pkg).await;
+
+        let container = match self.svc.get_app_container_cached(&serial, pkg).await {
+            Ok(path) => path,
+            Err(e) => {
+                return Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("Failed to locate app container: {e}"),
+                    )
+                    .await);
+            }
+        };
+
+        // Clear the container in-place rather than rm -rf. Deleting
+        // the container directory entirely can cause iOS to lose
+        // its internal bundle-id → container UUID mapping, making
+        // the app launch into a fresh container instead of the one
+        // we extracted into.
+        if let Err(e) = ios::device::clear_container(&container).await {
+            warn!(%pkg, error = %e, "clear_container failed, continuing");
+        }
+
+        // Archives saved by newer daemons carry the simulator
+        // keychain under a reserved member; older archives don't,
+        // and restore exactly as before.
+        let has_keychain = match tokio::process::Command::new("tar")
+            .args(["tzf", local_path])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                ios::device::archive_has_keychain_member(&String::from_utf8_lossy(&out.stdout))
+            }
+            _ => false,
+        };
+
+        // Exclude both the `./`-prefixed form (how bsdtar stores it
+        // when we add it on save) and the bare form, so the keychain
+        // member can never be extracted into the app container
+        // regardless of how the archive recorded it.
+        let member = ios::device::KEYCHAIN_ARCHIVE_MEMBER;
+        let member_pattern = format!("./{member}");
+        // The archive carries the *source* container's
+        // container-manager metadata; keep this container's own
+        // (PILOT-462). bsdtar's --exclude is not anchored, so the
+        // files are put back after the extract rather than excluded.
+        // Spawned, so a cancelled request (its future dropped
+        // mid-extract) still finishes the extract and the put-back
+        // instead of leaving the archive's record in the container.
+        let output = {
+            let container = container.clone();
+            let local_path = local_path.clone();
+            let excludes = [
+                member_pattern.clone(),
+                format!("{member_pattern}/*"),
+                member.to_string(),
+                format!("{member}/*"),
+            ];
+            tokio::spawn(async move {
+                ios::device::keeping_container_manager_files(&container, async {
+                    let mut tar = tokio::process::Command::new("tar");
+                    tar.args(["xzf", local_path.as_str(), "-C", container.as_str()]);
+                    for pattern in &excludes {
+                        tar.args(["--exclude", pattern.as_str()]);
+                    }
+                    tar.output().await
+                })
+                .await
+            })
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
+        };
+
+        match output {
+            Ok(out) if out.status.success() => {
+                if has_keychain && !ios::device::keychain_state_disabled() {
+                    if let Err(e) =
+                        restore_simulator_keychain(&serial, &container, local_path).await
+                    {
+                        // Failing silently here would reproduce the
+                        // half-restored auth state this feature
+                        // exists to fix — surface it instead.
+                        return Ok(self
+                            .svc
+                            .action_error(
+                                request_id,
+                                "APP_STATE_RESTORE_FAILED",
+                                format!("Keychain restore failed: {e}"),
+                            )
+                            .await);
+                    }
+                } else if has_keychain {
+                    debug!(%pkg, "Archive contains keychain state but TAPSMITH_NO_KEYCHAIN_STATE is set; skipping keychain restore");
+                } else {
+                    debug!(%pkg, "Archive has no keychain member (saved by an older version); skipping keychain restore");
+                }
+                info!(%pkg, %local_path, container, "iOS simulator app state restored");
+                Ok(TapsmithServiceImpl::success_action_response(request_id))
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                Ok(self
+                    .svc
+                    .action_error(
+                        request_id,
+                        "APP_STATE_RESTORE_FAILED",
+                        format!("tar extract failed: {stderr}"),
+                    )
+                    .await)
+            }
+            Err(e) => Ok(self
+                .svc
+                .action_error(
+                    request_id,
+                    "APP_STATE_RESTORE_FAILED",
+                    format!("Failed to run tar: {e}"),
+                )
+                .await),
+        }
+    }
+
+    async fn list_web_views(
+        &self,
+        request_id: String,
+        serial: String,
+    ) -> Result<Response<proto::ListWebViewsResponse>, Status> {
+        #[cfg(target_os = "macos")]
+        {
+            use crate::ios::webkit_debug_proxy::WebkitDebugProxyHandle;
+
+            let mut proxy_guard = self.svc.webkit_debug_proxy.write().await;
+            if proxy_guard.is_none() {
+                match WebkitDebugProxyHandle::start(serial.clone(), 9221).await {
+                    Ok(handle) => {
+                        *proxy_guard = Some(handle);
+                    }
+                    Err(e) => {
+                        return Ok(Response::new(proto::ListWebViewsResponse {
+                            request_id,
+                            webviews: Vec::new(),
+                            error_message: format!("Failed to start ios_webkit_debug_proxy: {e}"),
+                        }));
+                    }
+                }
+            }
+            let port = proxy_guard.as_ref().unwrap().port();
+            drop(proxy_guard);
+
+            // Query the proxy's HTTP endpoint for available targets
+            match query_cdp_json(port).await {
+                Ok(targets) => {
+                    let webviews = targets
+                        .into_iter()
+                        .filter_map(|t| {
+                            let ws_url = t.get("webSocketDebuggerUrl")?.as_str()?;
+                            Some(proto::WebViewInfo {
+                                socket_name: ws_url.to_string(),
+                                pid: 0,
+                                package_name: String::new(),
+                                url: t
+                                    .get("url")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                                title: t
+                                    .get("title")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("")
+                                    .to_string(),
+                            })
+                        })
+                        .collect();
+                    Ok(Response::new(proto::ListWebViewsResponse {
+                        request_id,
+                        webviews,
+                        error_message: String::new(),
+                    }))
+                }
+                Err(e) => Ok(Response::new(proto::ListWebViewsResponse {
+                    request_id,
+                    webviews: Vec::new(),
+                    error_message: format!(
+                        "Failed to query ios_webkit_debug_proxy: {e}. \
+                                 Ensure Safari Web Inspector is enabled on the device \
+                                 and the WebView has isInspectable = true (iOS 16.4+)."
+                    ),
+                })),
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(Response::new(proto::ListWebViewsResponse {
+                request_id,
+                webviews: Vec::new(),
+                error_message: "iOS WebView testing requires macOS".to_string(),
+            }))
+        }
+    }
+
+    async fn forward_web_view_port(
+        &self,
+        request_id: String,
+        _serial: String,
+        req: proto::ForwardWebViewPortRequest,
+    ) -> Result<Response<proto::ForwardWebViewPortResponse>, Status> {
+        // For iOS, the socket_name IS the webSocketDebuggerUrl —
+        // extract the port from it and return it directly since
+        // ios_webkit_debug_proxy already exposes targets on localhost.
+        let port = extract_port_from_ws_url(&req.socket_name).unwrap_or(0);
+        if port == 0 {
+            return Ok(Response::new(proto::ForwardWebViewPortResponse {
+                request_id,
+                success: false,
+                local_port: 0,
+                error_message: format!(
+                    "Failed to extract port from WebSocket URL: {}",
+                    req.socket_name
+                ),
+            }));
+        }
+        Ok(Response::new(proto::ForwardWebViewPortResponse {
+            request_id,
+            success: true,
+            local_port: port as u32,
+            error_message: String::new(),
+        }))
+    }
 }

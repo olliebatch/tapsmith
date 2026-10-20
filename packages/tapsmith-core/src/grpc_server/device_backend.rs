@@ -109,6 +109,31 @@ pub(super) trait DeviceBackend: Send + Sync {
     ) -> ActionResult;
     /// Whether a deep link can be delivered by cold-launching the app with it.
     async fn supports_cold_deep_link(&self) -> bool;
+
+    // ─── App state and web views ───
+    async fn save_app_state(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::SaveAppStateRequest,
+    ) -> ActionResult;
+    async fn restore_app_state(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::RestoreAppStateRequest,
+    ) -> ActionResult;
+    async fn list_web_views(
+        &self,
+        request_id: String,
+        serial: String,
+    ) -> Result<Response<proto::ListWebViewsResponse>, Status>;
+    async fn forward_web_view_port(
+        &self,
+        request_id: String,
+        serial: String,
+        req: proto::ForwardWebViewPortRequest,
+    ) -> Result<Response<proto::ForwardWebViewPortResponse>, Status>;
 }
 
 /// The backend for `platform`, borrowing `svc` for the call.
