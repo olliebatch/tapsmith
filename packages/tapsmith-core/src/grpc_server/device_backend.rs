@@ -8,13 +8,9 @@
 //! Backends borrow the service (like `ServiceResetOps`) so they can reuse its
 //! agent connection, device lookup and error-screenshot helpers.
 
-use tonic::{Response, Status};
-
 use super::android_backend::AndroidBackend;
 use super::ios_backend::IosBackend;
-use super::TapsmithServiceImpl;
-use crate::platform::Platform;
-use crate::proto;
+use super::*;
 
 pub(super) type ActionResult = Result<Response<proto::ActionResponse>, Status>;
 
@@ -74,6 +70,45 @@ pub(super) trait DeviceBackend: Send + Sync {
     async fn open_quick_settings(&self, request_id: String) -> ActionResult;
     async fn wake(&self, request_id: String) -> ActionResult;
     async fn unlock(&self, request_id: String) -> ActionResult;
+
+    // ─── App lifecycle ───
+    async fn app_is_running(&self, package: &str) -> Option<bool>;
+    async fn relaunch_app(
+        &self,
+        serial: &str,
+        package_name: &str,
+        wait_for_idle: bool,
+        idle_timeout_ms: u64,
+    ) -> Result<(), String>;
+    async fn wipe_app_data(&self, serial: &str, package_name: &str) -> Result<(), String>;
+    async fn deliver_deep_link(
+        &self,
+        request_id: String,
+        uri: &str,
+        delivery: DeepLinkDelivery,
+        ack_epoch_gt: Option<u64>,
+        ack_boot_before: Option<String>,
+        ack_nav_gt: Option<u64>,
+    ) -> ActionResult;
+    async fn launch_app(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::LaunchAppRequest,
+    ) -> ActionResult;
+    async fn restart_app(
+        &self,
+        request_id: String,
+        serial: String,
+        req: &proto::RestartAppRequest,
+    ) -> ActionResult;
+    async fn clear_app_data(
+        &self,
+        request_id: String,
+        req: &proto::ClearAppDataRequest,
+    ) -> ActionResult;
+    /// Whether a deep link can be delivered by cold-launching the app with it.
+    async fn supports_cold_deep_link(&self) -> bool;
 }
 
 /// The backend for `platform`, borrowing `svc` for the call.

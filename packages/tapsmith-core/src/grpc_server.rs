@@ -1218,7 +1218,7 @@ impl TapsmithServiceImpl {
         ack_epoch_gt: Option<u64>,
         mut ack_boot_before: Option<String>,
     ) -> Result<Response<proto::ActionResponse>, Status> {
-        let platform = self.require_platform().await?;
+        let backend = self.backend().await?;
         // Plain navigation links (no reset-epoch ack) can still be positively
         // acknowledged when the app mounts `@tapsmith/react-native` with a
         // `nav` counter: the app bumps it for every URL it receives, so even a
@@ -1250,422 +1250,16 @@ impl TapsmithServiceImpl {
                 }
             }
         }
-        match platform {
-            Platform::Ios => {
-                let bundle_id = self
-                    .ios_agent_config
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|c| c.target_package.clone())
-                    .filter(|p| !p.is_empty())
-                    .ok_or_else(|| {
-                        Status::failed_precondition(
-                            "device.openDeepLink requires an active agent session \
-                             with a target package. Call startAgent first.",
-                        )
-                    })?;
-                let serial = self.active_serial().await?;
-
-                if self.is_active_ios_physical().await {
-                    // Physical: use the agent's XCUIApplication.open(url:).
-                    let command = AgentCommand::OpenDeepLink {
-                        url: uri.to_string(),
-                        package: bundle_id,
-                        deliver_in_process: true,
-                        require_ui_change: false,
-                        ack_epoch_gt,
-                        ack_boot_before: ack_boot_before.clone(),
-                        ack_nav_gt,
-                    };
-                    let result = Self::require_epoch_ack_echo(
-                        ack_epoch_gt,
-                        self.send_agent_command(&command).await,
-                    );
-                    return self.make_action_response(request_id, result).await;
-                }
-
-                // Simulator: warm-first, cold fallback.
-                //
-                // Warm attempt: if the app is already running with rendered
-                // content, deliver in-process (the physical-device path:
-                // activate + XCUIApplication.open(url:)) and require the UI
-                // hierarchy to change from its pre-open state within a bounded
-                // window. The hierarchy-change requirement is what makes warm
-                // delivery verifiable — a warm app trivially "has rendered
-                // content", so the cold verify's readiness check would mask a
-                // dropped Linking event. This skips the terminate -> cold
-                // relaunch cycle (~14-22s on CI) for the common case: per-test
-                // soft resets and in-test navigation against a running app.
-                //
-                // The historical reasons for avoiding this path no longer
-                // hold as written: the "open(url:) hangs on quiescence" finding
-                // predates the QuiescenceDisabler swizzle (which the agent now
-                // applies before delivery), and the "warm delivery doesn't
-                // trigger RN navigation" finding was observed with warm
-                // `simctl openurl`, not XCUIApplication.open(url:) — which
-                // physical devices use for every deep link today. The fallback
-                // below keeps behavior identical when warm delivery doesn't
-                // land; the worst case is the status quo plus one bounded
-                // warm window (IOS_OPEN_DEEP_LINK_WARM_TIMEOUT_MS).
-                //
-                // `force_cold_launch` skips the warm attempt entirely. The SDK
-                // sets it for the between-file soft reset: a July 2026 local
-                // soak of the full E2E suite showed that sessions running
-                // all-warm for ~60+ deliveries accumulate native navigation
-                // state that observably diverges from a cold launch (screen
-                // a11y trees stop being flattened — strict-mode selectors that
-                // matched one element start matching two — and element ids go
-                // stale), while every file-sized warm window (~20-30
-                // deliveries from a cold start) stayed green. Cold-launching
-                // at file boundaries pins each file to the exact starting
-                // state it had before warm delivery existed and bounds the
-                // warm window to one file.
-                if delivery != DeepLinkDelivery::Cold {
-                    let warm_command = AgentCommand::OpenDeepLink {
-                        url: uri.to_string(),
-                        package: bundle_id.clone(),
-                        deliver_in_process: true,
-                        // With an epoch or nav ack the in-app hook is the
-                        // verifier; otherwise fall back to the hierarchy-change
-                        // heuristic (older app builds without the nav counter).
-                        require_ui_change: ack_epoch_gt.is_none() && ack_nav_gt.is_none(),
-                        ack_epoch_gt,
-                        ack_boot_before: ack_boot_before.clone(),
-                        ack_nav_gt,
-                    };
-                    let warm_result = Self::require_epoch_ack_echo(
-                        ack_epoch_gt,
-                        self.send_agent_command_with_timeout(
-                            &warm_command,
-                            IOS_OPEN_DEEP_LINK_WARM_TIMEOUT_MS,
-                        )
-                        .await,
-                    );
-                    let warm_only = delivery == DeepLinkDelivery::WarmOnly;
-                    let next = if warm_only {
-                        "reporting the miss to the caller"
-                    } else {
-                        "falling back to cold relaunch"
-                    };
-                    match &warm_result {
-                        Ok(resp) if resp.success => {
-                            return self.make_action_response(request_id, warm_result).await;
-                        }
-                        Ok(resp) => {
-                            info!(
-                                %serial, uri = %uri,
-                                error = %resp.error.as_deref().unwrap_or("unknown"),
-                                "warm in-process deep link did not land; {next}"
-                            );
-                        }
-                        Err(status) => {
-                            info!(
-                                %serial, uri = %uri, error = %status.message(),
-                                "warm in-process deep link errored; {next}"
-                            );
-                        }
-                    }
-                    if warm_only {
-                        return self.make_action_response(request_id, warm_result).await;
-                    }
-                }
-
-                // Cold fallback: terminate -> simctl openurl -> agent verify,
-                // retried as a unit. The first cold, trust-gated openurl on a
-                // fresh sim intermittently fails to foreground the app (the
-                // "Open in <app>?" prompt races the launch and the app lands
-                // back on SpringBoard). Re-delivering self-heals: a second
-                // openurl is warm and already trusted, so it lands. We only
-                // succeed once the agent confirms the app actually rendered
-                // content (the verify returns false on a never-foregrounded app
-                // rather than masking it).
-                //
-                // simctl openurl to a running app doesn't trigger navigation
-                // (the React Native scene handler misses it), so we terminate
-                // first — making openurl cold-launch the app with the URL.
-                // Fresh simulators can show "Open in <app>?" and block simctl
-                // itself, so the daemon taps that dialog while openurl is
-                // still pending.
-                let max_attempts = IOS_OPEN_DEEP_LINK_MAX_ATTEMPTS;
-                let mut last_error = "openDeepLink: app did not reach destination".to_string();
-                let mut verify_result: Option<Result<AgentResponse, Status>> = None;
-                let mut attempt: u32 = 0;
-                // One-shot escalation for the compositor outage: when the
-                // agent reports the display is not rendering (black screen
-                // with a healthy a11y tree), app relaunches provably don't
-                // recover it — only recreating the whole render surface does.
-                // Reboot the simulator, bring the agent back, and re-deliver.
-                let mut rebooted_for_black_display = false;
-                loop {
-                    attempt += 1;
-                    if last_error.contains("display is not rendering")
-                        && !rebooted_for_black_display
-                        && !self.is_active_ios_physical().await
-                    {
-                        rebooted_for_black_display = true;
-                        warn!(
-                            %serial, uri = %uri,
-                            "display is not rendering and an app relaunch cannot recover a dead \
-                             compositor; rebooting the simulator and restarting the agent"
-                        );
-                        let _ = ios::device::shutdown_simulator(&serial).await;
-                        if let Err(e) = ios::device::boot_simulator(&serial).await {
-                            warn!(%serial, error = %e, "simulator reboot failed; continuing with re-delivery");
-                        } else {
-                            // Give SpringBoard a moment past `Booted` before
-                            // asking xcodebuild to install/launch the runner.
-                            tokio::time::sleep(Duration::from_secs(5)).await;
-                            if let Err(e) = self
-                                .restart_ios_agent_for_app(&serial, &bundle_id, false, 5_000)
-                                .await
-                            {
-                                warn!(%serial, error = %e, "agent restart after simulator reboot failed");
-                            }
-                        }
-                        // The reboot is recovery, not a delivery attempt —
-                        // don't let it consume one.
-                        attempt -= 1;
-                    }
-                    // The terminate MUST actually land: `simctl openurl` to a
-                    // still-running app foregrounds it without delivering any
-                    // navigation event to React Native, and the verify below
-                    // can't tell that apart from a legitimate delivery whose
-                    // destination renders like the current screen — the app
-                    // silently stays where it was while the reset "succeeds".
-                    // The agent now confirms the process died; when it can't
-                    // (observed under CoreSimulator pressure with agent
-                    // commands running 10-40s), force it host-side before
-                    // delivering.
-                    let terminate_confirmed = matches!(
-                        self.send_agent_command_with_timeout(
-                            &AgentCommand::TerminateApp {
-                                package: bundle_id.clone(),
-                            },
-                            10_000,
-                        )
-                        .await,
-                        Ok(resp) if resp.success
-                    );
-                    if !terminate_confirmed {
-                        warn!(
-                            %serial, uri = %uri,
-                            "agent could not confirm app termination; forcing simctl \
-                             terminate so openurl cold-launches the app"
-                        );
-                        let _ = ios::device::terminate_app(&serial, &bundle_id).await;
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-
-                    if let Err(e) = self
-                        .open_ios_simulator_url_with_prompt_handling(&serial, uri)
-                        .await
-                    {
-                        if ios::device::is_retryable_open_url_error(&e.to_string()) {
-                            last_error = e.to_string();
-                            if attempt >= max_attempts {
-                                warn!(
-                                    %serial, uri = %uri, attempt, max_attempts,
-                                    error = %e,
-                                    "simctl openurl kept hitting a transient timeout; giving up"
-                                );
-                                break;
-                            }
-                            warn!(
-                                %serial, uri = %uri, attempt,
-                                error = %e,
-                                "simctl openurl hit a transient timeout; re-delivering deep link"
-                            );
-                            tokio::time::sleep(Duration::from_millis(500)).await;
-                            continue;
-                        }
-                        return Ok(self
-                            .action_error(request_id, "ACTION_FAILED", e.to_string())
-                            .await);
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-
-                    let command = AgentCommand::OpenDeepLink {
-                        url: uri.to_string(),
-                        package: bundle_id.clone(),
-                        deliver_in_process: false,
-                        require_ui_change: false,
-                        ack_epoch_gt,
-                        ack_boot_before: ack_boot_before.clone(),
-                        ack_nav_gt,
-                    };
-                    let result = Self::require_epoch_ack_echo(
-                        ack_epoch_gt,
-                        self.send_agent_command_with_timeout(
-                            &command,
-                            IOS_OPEN_DEEP_LINK_VERIFY_TIMEOUT_MS,
-                        )
-                        .await,
-                    );
-                    if matches!(&result, Ok(resp) if resp.success) {
-                        verify_result = Some(result);
-                        break;
-                    }
-                    last_error = match &result {
-                        Ok(resp) => resp.error.clone().unwrap_or_else(|| {
-                            "app did not reach deep-link destination".to_string()
-                        }),
-                        Err(status) => status.message().to_string(),
-                    };
-                    verify_result = Some(result);
-                    // A display-not-rendering failure is exempt from the
-                    // attempt cap until the one-shot reboot escalation (top of
-                    // loop) has had its chance — re-delivery alone provably
-                    // can't fix it, so counting it against the cap just gives up.
-                    let reboot_pending = last_error.contains("display is not rendering")
-                        && !rebooted_for_black_display;
-                    if attempt >= max_attempts && !reboot_pending {
-                        warn!(
-                            %serial, uri = %uri, attempt, max_attempts,
-                            error = %last_error,
-                            "deep link did not reach its destination after retries; giving up"
-                        );
-                        break;
-                    }
-                    warn!(
-                        %serial, uri = %uri, attempt,
-                        error = %last_error,
-                        "deep link did not reach its destination; re-delivering"
-                    );
-                }
-
-                match verify_result {
-                    Some(result) => self.make_action_response(request_id, result).await,
-                    None => Ok(self
-                        .action_error(request_id, "ACTION_FAILED", last_error)
-                        .await),
-                }
-            }
-            Platform::Android => {
-                if uri.contains('\'') {
-                    return Err(Status::invalid_argument(
-                        "uri contains an invalid character: single quote (') is not allowed",
-                    ));
-                }
-                let serial = self.active_serial().await?;
-                let target_package = self
-                    .started_agent_config
-                    .read()
-                    .await
-                    .as_ref()
-                    .map(|c| c.target_package.clone())
-                    .filter(|p| !p.is_empty());
-
-                let cmd = format!("am start -a android.intent.action.VIEW -d '{}'", uri);
-                if let Err(e) = adb::shell(&serial, &cmd).await {
-                    let screenshot = self.error_screenshot().await;
-                    return Ok(Response::new(proto::ActionResponse {
-                        request_id,
-                        success: false,
-                        error_type: "ADB_COMMAND_FAILED".to_string(),
-                        error_message: e.to_string(),
-                        screenshot,
-                    }));
-                }
-
-                // Settle: with an epoch ack, wait for the in-app hook to
-                // confirm the reset ran; otherwise wait for the target app to
-                // be the resumed activity. Neither compares whole hierarchies —
-                // a link that lands on the screen already showing used to stall
-                // here for the full 10s window and then re-fire the intent.
-                let started = tokio::time::Instant::now();
-                let mut refired = false;
-                loop {
-                    tokio::time::sleep(ANDROID_DEEP_LINK_POLL).await;
-                    let elapsed = started.elapsed();
-
-                    let satisfied = match (ack_epoch_gt, ack_nav_gt) {
-                        (Some(before), _) => match self.current_hooks_marker(5_000).await {
-                            Some(marker)
-                                if app_reset::hooks_acknowledged(
-                                    before,
-                                    ack_boot_before.as_deref(),
-                                    &marker,
-                                ) =>
-                            {
-                                if let Some(err) = marker.err {
-                                    return Ok(self
-                                        .action_error(
-                                            request_id,
-                                            "ACTION_FAILED",
-                                            format!("in-app reset reported an error: {err}"),
-                                        )
-                                        .await);
-                                }
-                                true
-                            }
-                            _ => false,
-                        },
-                        // Navigation link into an app with the nav counter:
-                        // the app bumping it is positive proof of delivery —
-                        // "resumed activity" can't tell a delivered same-screen
-                        // link from a dropped one.
-                        (None, Some(nav_before)) => match self.current_hooks_marker(5_000).await {
-                            Some(marker) => app_reset::nav_acknowledged(
-                                nav_before,
-                                ack_boot_before.as_deref(),
-                                &marker,
-                            ),
-                            None => false,
-                        },
-                        (None, None) => match (&target_package, self.get_current_component().await)
-                        {
-                            (Some(target), Ok(Some((pkg, _)))) => &pkg == target,
-                            // No target to judge against: the intent was
-                            // accepted, that is all we can know.
-                            (None, _) => true,
-                            _ => false,
-                        },
-                    };
-                    if satisfied {
-                        break;
-                    }
-                    let deadline = if ack_epoch_gt.is_some() {
-                        ANDROID_HOOK_ACK_TIMEOUT
-                    } else {
-                        ANDROID_DEEP_LINK_SETTLE_TIMEOUT
-                    };
-                    if elapsed >= deadline {
-                        if ack_epoch_gt.is_some() {
-                            return Ok(self
-                                .action_error(
-                                    request_id,
-                                    "ACTION_FAILED",
-                                    format!(
-                                        "in-app reset did not acknowledge within {}ms",
-                                        deadline.as_millis()
-                                    ),
-                                )
-                                .await);
-                        }
-                        // Navigation links are best-effort here, as before: the
-                        // caller's own assertions decide whether it landed.
-                        break;
-                    }
-                    if !refired && elapsed >= ANDROID_DEEP_LINK_REFIRE_AFTER {
-                        refired = true;
-                        debug!("Deep link: target not resumed yet, re-firing intent once");
-                        let _ = adb::shell(&serial, &cmd).await;
-                    }
-                }
-
-                // Final idle wait so animations finish before the caller
-                // interacts with the new screen.
-                let idle_cmd = AgentCommand::WaitForIdle {
-                    timeout_ms: Some(ANDROID_DEEP_LINK_IDLE_TIMEOUT_MS),
-                };
-                let _ = self
-                    .send_agent_command_with_timeout(&idle_cmd, ANDROID_DEEP_LINK_IDLE_TIMEOUT_MS)
-                    .await;
-
-                Ok(Self::success_action_response(request_id))
-            }
-        }
+        backend
+            .deliver_deep_link(
+                request_id,
+                uri,
+                delivery,
+                ack_epoch_gt,
+                ack_boot_before,
+                ack_nav_gt,
+            )
+            .await
     }
 
     async fn current_hierarchy_xml(&self, timeout_ms: u64) -> Option<String> {
@@ -1689,29 +1283,7 @@ impl TapsmithServiceImpl {
     /// Whether `package` has a live process. `None` when it cannot be told
     /// (no agent, command failure).
     async fn app_is_running(&self, package: &str) -> Option<bool> {
-        match self.require_platform().await.ok()? {
-            Platform::Ios => {
-                let command = AgentCommand::GetAppState {
-                    package: package.to_string(),
-                };
-                let result = self.send_agent_command(&command).await.ok()?;
-                let state = result.data.get("state").and_then(|v| v.as_str())?;
-                Some(!matches!(
-                    state,
-                    "stopped" | "not_running" | "notRunning" | "unknown"
-                ))
-            }
-            Platform::Android => {
-                // `pidof` exits non-zero when nothing matches, which adb::shell
-                // surfaces as an error — `|| true` makes "no process" read as
-                // not running rather than unknown.
-                let serial = self.active_serial().await.ok()?;
-                let out = adb::shell(&serial, &format!("pidof {package} 2>/dev/null || true"))
-                    .await
-                    .ok()?;
-                Some(!out.trim().is_empty())
-            }
-        }
+        self.backend().await.ok()?.app_is_running(package).await
     }
 
     /// Terminate + relaunch keeping data — the `restart` rung of the reset ladder.
@@ -1725,20 +1297,11 @@ impl TapsmithServiceImpl {
         // The relaunched process may render a marker an earlier probe missed
         // (see `nav_probe_found_no_marker`).
         *self.nav_probe_found_no_marker.write().await = false;
-        match self
-            .require_platform()
+        self.backend()
             .await
             .map_err(|e| e.message().to_string())?
-        {
-            Platform::Ios => {
-                self.reset_ios_app(serial, package_name, wait_for_idle, idle_timeout_ms)
-                    .await
-            }
-            Platform::Android => {
-                self.android_clean_relaunch(serial, package_name, wait_for_idle, idle_timeout_ms)
-                    .await
-            }
-        }
+            .relaunch_app(serial, package_name, wait_for_idle, idle_timeout_ms)
+            .await
     }
 
     /// Relaunch an Android app from a clean task, then wait for it to render.
@@ -1854,75 +1417,11 @@ impl TapsmithServiceImpl {
     /// Wipe app data — the `clear` rung of the reset ladder, without the
     /// relaunch. Mirrors the `ClearAppData` RPC's platform behaviour.
     async fn clear_app_data_inner(&self, serial: &str, package_name: &str) -> Result<(), String> {
-        match self
-            .require_platform()
+        self.backend()
             .await
             .map_err(|e| e.message().to_string())?
-        {
-            Platform::Ios => {
-                if self.is_active_ios_physical().await {
-                    let app_path = self
-                        .ios_agent_config
-                        .read()
-                        .await
-                        .as_ref()
-                        .and_then(|c| c.app_path.clone())
-                        .ok_or_else(|| {
-                            "clearing app data on a physical iOS device requires the app \
-                             bundle path passed at startAgent time"
-                                .to_string()
-                        })?;
-                    if let Err(e) = ios::device::uninstall_app_on_device(serial, package_name).await
-                    {
-                        warn!(error = %e, "Uninstall step of physical-iOS clear failed, continuing to reinstall");
-                    }
-                    ios::device::install_app_on_device(serial, &app_path)
-                        .await
-                        .map_err(|e| format!("reinstall failed: {e}"))?;
-                    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-                    return Ok(());
-                }
-                // Terminate first (as launch_app's own clear path does): a
-                // running process flushes UserDefaults / caches on exit, which
-                // would resurrect state deleted from under it.
-                let _ = ios::device::terminate_app(serial, package_name).await;
-                match self.get_app_container_cached(serial, package_name).await {
-                    Ok(ref container) => {
-                        if let Err(e) = ios::device::clear_container(container).await {
-                            warn!(error = %e, "Failed to clear app container, continuing anyway");
-                        }
-                        if !ios::device::keychain_state_disabled() {
-                            if let Some(keychain_dir) =
-                                ios::device::simulator_keychain_dir(container)
-                            {
-                                if let Err(e) =
-                                    ios::device::clear_keychain(serial, &keychain_dir).await
-                                {
-                                    warn!(error = %e, "Failed to clear simulator keychain, continuing anyway");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "Could not get app container (app may not be installed)");
-                    }
-                }
-                Ok(())
-            }
-            Platform::Android => {
-                let output = adb::shell(serial, &format!("pm clear {}", package_name))
-                    .await
-                    .map_err(|e| format!("pm clear failed: {e}"))?;
-                if output.trim().starts_with("Success") {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "pm clear did not report success: {}",
-                        output.trim()
-                    ))
-                }
-            }
-        }
+            .wipe_app_data(serial, package_name)
+            .await
     }
 
     /// Require the active device's platform, returning a gRPC error if
@@ -4133,7 +3632,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
         let serial = self.active_serial().await?;
-        let platform = self.require_platform().await?;
+        let backend = self.backend().await?;
 
         Self::validate_package_name(&req.package_name)?;
 
@@ -4141,144 +3640,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         // reinstalled build) — let the next navigation link re-probe.
         *self.nav_probe_found_no_marker.write().await = false;
 
-        match platform {
-            Platform::Ios => {
-                let idle_timeout_ms = if req.idle_timeout_ms > 0 {
-                    req.idle_timeout_ms
-                } else {
-                    10000
-                };
-                let is_physical = self.is_active_ios_physical().await;
-
-                if req.clear_data {
-                    if is_physical {
-                        // Physical devices have no host-accessible app container
-                        // filesystem — `get_app_container` / `clear_container`
-                        // are simulator-only hacks. Instead, we rely on the
-                        // agent-mediated relaunch below to provide a fresh
-                        // launch; to actually wipe persistent state on a
-                        // physical device the user must reinstall the app
-                        // (future work: wire reinstall via devicectl into
-                        // clear_data).
-                        warn!(
-                            package = %req.package_name,
-                            "clear_data on physical iOS device is best-effort: \
-                             persistent AsyncStorage/caches are not wiped. \
-                             Reinstall the app via `tapsmith test --force-install` \
-                             for a clean slate."
-                        );
-                    } else {
-                        // Terminate the app first to avoid file access conflicts
-                        // when clearing the data container.
-                        let _ = ios::device::terminate_app(&serial, &req.package_name).await;
-                        // Clear the data container (AsyncStorage, caches, etc.)
-                        // without uninstalling the app.
-                        match self
-                            .get_app_container_cached(&serial, &req.package_name)
-                            .await
-                        {
-                            Ok(ref container) => {
-                                if let Err(e) = ios::device::clear_container(container).await {
-                                    warn!(error = %e, "Failed to clear app container");
-                                }
-                            }
-                            Err(e) => {
-                                debug!(error = %e, "Could not get app container");
-                            }
-                        }
-                    }
-                }
-
-                if let Err(error_message) = self
-                    .reset_ios_app(
-                        &serial,
-                        &req.package_name,
-                        req.wait_for_idle,
-                        idle_timeout_ms,
-                    )
-                    .await
-                {
-                    return Ok(self
-                        .action_error(request_id, "LAUNCH_FAILED", error_message)
-                        .await);
-                }
-
-                Ok(Response::new(proto::ActionResponse {
-                    request_id,
-                    success: true,
-                    error_type: String::new(),
-                    error_message: String::new(),
-                    screenshot: Vec::new(),
-                }))
-            }
-            Platform::Android => {
-                if !req.activity.is_empty() {
-                    Self::validate_activity(&req.activity)?;
-                }
-
-                // Clear data first if requested
-                if req.clear_data {
-                    match adb::shell(&serial, &format!("pm clear {}", req.package_name)).await {
-                        Ok(output) if !output.trim().starts_with("Success") => {
-                            error!(output = %output.trim(), "pm clear did not report success");
-                            let screenshot = self.error_screenshot().await;
-                            return Ok(Response::new(proto::ActionResponse {
-                                request_id,
-                                success: false,
-                                error_type: "CLEAR_DATA_FAILED".to_string(),
-                                error_message: format!(
-                                    "Failed to clear app data: {}",
-                                    output.trim()
-                                ),
-                                screenshot,
-                            }));
-                        }
-                        Err(e) => {
-                            error!(error = %e, "Failed to clear app data before launch");
-                            let screenshot = self.error_screenshot().await;
-                            return Ok(Response::new(proto::ActionResponse {
-                                request_id,
-                                success: false,
-                                error_type: "CLEAR_DATA_FAILED".to_string(),
-                                error_message: format!("Failed to clear app data: {e}"),
-                                screenshot,
-                            }));
-                        }
-                        Ok(_) => {} // Success
-                    }
-                }
-
-                if req.activity.is_empty() {
-                    self.launch_package(
-                        &serial,
-                        request_id,
-                        &req.package_name,
-                        req.wait_for_idle,
-                        req.idle_timeout_ms,
-                    )
-                    .await
-                } else {
-                    // -S force-stops the app before launching, ensuring no
-                    // residual savedInstanceState Bundle survives from a
-                    // previous Activity. Without it, React Navigation /
-                    // Expo Router can restore stale navigation state from
-                    // the Bundle even after pm clear wiped AsyncStorage.
-                    // --activity-clear-task ensures a fresh task stack.
-                    let cmd = format!(
-                        "am start -S --activity-clear-task -n {}/{}",
-                        req.package_name, req.activity,
-                    );
-                    self.launch_and_idle(
-                        &serial,
-                        request_id,
-                        &cmd,
-                        req.wait_for_idle,
-                        req.idle_timeout_ms,
-                    )
-                    .await
-                }
-            }
-        }
+        backend.launch_app(request_id, serial, &req).await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -4343,8 +3705,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let request_id = Self::request_id(&req.request_id);
         Self::validate_package_name(&req.package_name)?;
         let serial = self.active_serial().await?;
-        let platform = self.require_platform().await?;
-        let is_physical = platform == Platform::Ios && self.is_active_ios_physical().await;
+        let supports_cold_delivery = self.backend().await?.supports_cold_deep_link().await;
         let idle_timeout_ms = if req.idle_timeout_ms > 0 {
             req.idle_timeout_ms
         } else {
@@ -4427,7 +3788,7 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
                     reset_deep_link: &req.reset_deep_link,
                     force_cold: req.force_cold,
                     cold_every_n: req.cold_every_n_resets,
-                    supports_cold_delivery: platform == Platform::Ios && !is_physical,
+                    supports_cold_delivery,
                     fallback_to_clear: req.fallback_to_clear,
                     allow_fallback: req.allow_fallback,
                 },
@@ -4561,57 +3922,8 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         Self::validate_package_name(&req.package_name)?;
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                let idle_timeout_ms = if req.idle_timeout_ms > 0 {
-                    req.idle_timeout_ms
-                } else {
-                    10000
-                };
-
-                if let Err(error_message) = self
-                    .reset_ios_app(
-                        &serial,
-                        &req.package_name,
-                        req.wait_for_idle,
-                        idle_timeout_ms,
-                    )
-                    .await
-                {
-                    return Ok(self
-                        .action_error(request_id, "LAUNCH_FAILED", error_message)
-                        .await);
-                }
-
-                Ok(Self::success_action_response(request_id))
-            }
-            Platform::Android => {
-                // Force-stop the app to kill the process and reset all in-memory state.
-                if let Err(e) =
-                    adb::shell(&serial, &format!("am force-stop {}", req.package_name)).await
-                {
-                    error!(error = %e, "Failed to force-stop app");
-                    let screenshot = self.error_screenshot().await;
-                    return Ok(Response::new(proto::ActionResponse {
-                        request_id,
-                        success: false,
-                        error_type: "FORCE_STOP_FAILED".to_string(),
-                        error_message: format!("Failed to stop app: {e}"),
-                        screenshot,
-                    }));
-                }
-
-                self.launch_package(
-                    &serial,
-                    request_id,
-                    &req.package_name,
-                    req.wait_for_idle,
-                    req.idle_timeout_ms,
-                )
-                .await
-            }
-        }
+        let backend = self.backend().await?;
+        backend.restart_app(request_id, serial, &req).await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -4657,125 +3969,8 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
 
         Self::validate_package_name(&req.package_name)?;
 
-        let platform = self.require_platform().await?;
-        match platform {
-            Platform::Ios => {
-                if self.is_active_ios_physical().await {
-                    // Physical devices have no host-accessible app container
-                    // filesystem, so `get_app_container` / `clear_container`
-                    // are meaningless. Reinstall the app bundle as the only
-                    // reliable way to wipe persistent state on a real device.
-                    // Requires the app path to have been cached during
-                    // StartAgent (via the StartAgentRequest.ios_app_path
-                    // field). Without it we can't reinstall and must surface
-                    // an actionable error.
-                    let serial = self.active_serial().await?;
-                    let app_path = self
-                        .ios_agent_config
-                        .read()
-                        .await
-                        .as_ref()
-                        .and_then(|c| c.app_path.clone());
-                    let Some(app_path) = app_path else {
-                        return Ok(self
-                            .action_error(
-                                request_id,
-                                "UNSUPPORTED_ON_PHYSICAL_DEVICE",
-                                "device.clearAppData on a physical iOS device requires the \
-                                 app bundle path to have been passed at startAgent time. \
-                                 Tapsmith's CLI does this automatically when `app` is set in \
-                                 your config. If you're calling startAgent manually, pass \
-                                 the device-signed .app path via StartAgentRequest.ios_app_path."
-                                    .to_string(),
-                            )
-                            .await);
-                    };
-                    // Uninstall + install is the only devicectl sequence
-                    // that actually wipes the app's data container on
-                    // physical iOS (plain `install` preserves the container
-                    // when replacing an existing bundle). Uninstall also
-                    // drops the bundle's LaunchServices URL-scheme entry,
-                    // so we wait briefly after install for LaunchServices
-                    // to re-index — without this, the first subsequent
-                    // `openDeepLink` call drops silently.
-                    if let Err(e) =
-                        ios::device::uninstall_app_on_device(&serial, &req.package_name).await
-                    {
-                        warn!(error = %e, "Uninstall step of physical-iOS clearAppData failed, continuing to reinstall");
-                    }
-                    if let Err(e) = ios::device::install_app_on_device(&serial, &app_path).await {
-                        return Ok(self
-                            .action_error(
-                                request_id,
-                                "ACTION_FAILED",
-                                format!("clearAppData reinstall failed: {e}"),
-                            )
-                            .await);
-                    }
-                    // Give LaunchServices time to re-index the bundle's URL
-                    // schemes. Without this, the next `openDeepLink` often
-                    // fires before iOS knows what app handles the scheme.
-                    tokio::time::sleep(std::time::Duration::from_millis(1_500)).await;
-                    return Ok(Response::new(proto::ActionResponse {
-                        request_id,
-                        success: true,
-                        error_type: String::new(),
-                        error_message: String::new(),
-                        screenshot: Vec::new(),
-                    }));
-                }
-                let serial = self.active_serial().await?;
-                // Clear the data container (AsyncStorage, UserDefaults, caches)
-                // but do NOT terminate the app — launchApp handles that and
-                // properly re-establishes the XCUITest accessibility bridge.
-                // Clearing data while the app is running is fine because the
-                // app will be relaunched anyway.
-                match self
-                    .get_app_container_cached(&serial, &req.package_name)
-                    .await
-                {
-                    Ok(ref container) => {
-                        if let Err(e) = ios::device::clear_container(container).await {
-                            warn!(error = %e, "Failed to clear app container, continuing anyway");
-                        }
-                        // Also clear the simulator's device-level keychain so
-                        // keychain-backed auth state (e.g. Firebase Auth)
-                        // doesn't survive a "full" data clear, leaving a
-                        // half-signed-in app. The keychain is device-global,
-                        // so this clears it for every app on the simulator —
-                        // acceptable for test-owned simulators.
-                        if !ios::device::keychain_state_disabled() {
-                            match ios::device::simulator_keychain_dir(container) {
-                                Some(keychain_dir) => {
-                                    if let Err(e) =
-                                        ios::device::clear_keychain(&serial, &keychain_dir).await
-                                    {
-                                        warn!(error = %e, "Failed to clear simulator keychain, continuing anyway");
-                                    }
-                                }
-                                None => {
-                                    warn!(container = %container, "Could not derive simulator keychain dir; keychain not cleared");
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "Could not get app container (app may not be installed)");
-                    }
-                }
-                Ok(Response::new(proto::ActionResponse {
-                    request_id,
-                    success: true,
-                    error_type: String::new(),
-                    error_message: String::new(),
-                    screenshot: Vec::new(),
-                }))
-            }
-            Platform::Android => {
-                let cmd = format!("pm clear {}", req.package_name);
-                self.adb_action(request_id, &cmd).await
-            }
-        }
+        let backend = self.backend().await?;
+        backend.clear_app_data(request_id, &req).await
     }
 
     #[instrument(skip_all, fields(request_id))]
