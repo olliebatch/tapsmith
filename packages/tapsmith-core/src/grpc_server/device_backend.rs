@@ -134,6 +134,14 @@ pub(super) trait DeviceBackend: Send + Sync {
         serial: String,
         req: proto::ForwardWebViewPortRequest,
     ) -> Result<Response<proto::ForwardWebViewPortResponse>, Status>;
+
+    // ─── Device setup and capture ───
+    async fn take_screenshot(
+        &self,
+        request_id: String,
+    ) -> Result<Response<proto::ScreenshotResponse>, Status>;
+    /// Called once a device is selected, before the first app launch.
+    async fn prearm_network_tracing(&self, req: &proto::SetDeviceRequest);
 }
 
 /// The backend for `platform`, borrowing `svc` for the call.

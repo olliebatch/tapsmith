@@ -2645,65 +2645,11 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
         let req = request.into_inner();
         let request_id = Self::request_id(&req.request_id);
 
-        let platform = self.require_platform().await?;
+        let backend = self.backend().await?;
 
         // On iOS, route through the agent (XCUIScreen.main.screenshot()) which
         // is much faster than spawning `xcrun simctl io screenshot` per call.
-        if platform == Platform::Ios {
-            let command = AgentCommand::Screenshot {};
-            // Use a short timeout — screenshots are best-effort for tracing
-            // and should not block for 30s if the agent is busy.
-            match self.send_agent_command_with_timeout(&command, 5000).await {
-                Ok(resp) if resp.success => {
-                    let b64_str = resp.data.get("data").and_then(|v| v.as_str()).unwrap_or("");
-                    use base64::Engine;
-                    match base64::engine::general_purpose::STANDARD.decode(b64_str) {
-                        Ok(data) => Ok(Response::new(proto::ScreenshotResponse {
-                            request_id,
-                            success: true,
-                            data,
-                            error_message: String::new(),
-                        })),
-                        Err(e) => Ok(Response::new(proto::ScreenshotResponse {
-                            request_id,
-                            success: false,
-                            data: Vec::new(),
-                            error_message: format!("Failed to decode screenshot data: {e}"),
-                        })),
-                    }
-                }
-                Ok(resp) => Ok(Response::new(proto::ScreenshotResponse {
-                    request_id,
-                    success: false,
-                    data: Vec::new(),
-                    error_message: resp
-                        .error
-                        .unwrap_or_else(|| "Screenshot failed".to_string()),
-                })),
-                Err(status) => Ok(Response::new(proto::ScreenshotResponse {
-                    request_id,
-                    success: false,
-                    data: Vec::new(),
-                    error_message: status.message().to_string(),
-                })),
-            }
-        } else {
-            let serial = self.active_serial().await?;
-            match screenshot::capture(&serial, platform).await {
-                Ok(data) => Ok(Response::new(proto::ScreenshotResponse {
-                    request_id,
-                    success: true,
-                    data,
-                    error_message: String::new(),
-                })),
-                Err(e) => Ok(Response::new(proto::ScreenshotResponse {
-                    request_id,
-                    success: false,
-                    data: Vec::new(),
-                    error_message: e.to_string(),
-                })),
-            }
-        }
+        backend.take_screenshot(request_id).await
     }
 
     #[instrument(skip_all, fields(request_id))]
@@ -2993,35 +2939,10 @@ impl proto::tapsmith_service_server::TapsmithService for TapsmithServiceImpl {
                         )
                         .await;
                 }
-                // For physical iOS with tracing enabled, pre-start the Wi-Fi
-                // MITM proxy immediately so any subsequent devicectl install
-                // / launch / xcodebuild invocation can't race the phone's
-                // OCSP check (which routes through the Wi-Fi proxy port on
-                // the Mac). When tracing is off, iOS has no reason to route
-                // through our proxy at all, so we skip the pre-start entirely
-                // — this is the single biggest basic-track failure reduction.
-                #[cfg(target_os = "macos")]
-                if req.network_tracing_enabled && self.is_active_ios_physical().await {
-                    self.ensure_ios_physical_proxy(&req.serial).await;
-                    // Push the current trace.networkHosts allowlist into
-                    // the live proxy so the next `/tapsmith.pac` fetch from
-                    // iOS reflects the user's tapsmith.config.ts exactly.
-                    // Safe to call while the proxy is serving traffic.
-                    if let Some(proxy) = self.network_proxy.read().await.as_ref() {
-                        proxy.set_network_hosts(req.network_hosts.clone()).await;
-                    }
-                }
-                // Symmetric to the iOS pre-arm above: for Android with tracing
-                // enabled, install the MITM CA now — during setup, before the
-                // first app launch — so the app under test forks from a zygote
-                // that already trusts the cert (Android 14+ injects into the
-                // zygote mount namespace, which only future forks inherit). This
-                // is what spares the first HTTPS request on a freshly-booted
-                // device. See `ensure_android_ca_installed`.
-                if req.network_tracing_enabled
-                    && self.active_platform().await == Some(Platform::Android)
-                {
-                    self.ensure_android_ca_installed(&req.serial).await;
+                // Pre-arm network tracing on the new device (a no-op when it is
+                // off), before any install or launch can race it.
+                if let Ok(backend) = self.backend().await {
+                    backend.prearm_network_tracing(&req).await;
                 }
                 Ok(Response::new(proto::ActionResponse {
                     request_id,

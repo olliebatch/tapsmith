@@ -942,4 +942,38 @@ impl DeviceBackend for AndroidBackend<'_> {
             })),
         }
     }
+
+    async fn take_screenshot(
+        &self,
+        request_id: String,
+    ) -> Result<Response<proto::ScreenshotResponse>, Status> {
+        let serial = self.svc.active_serial().await?;
+        match screenshot::capture(&serial, Platform::Android).await {
+            Ok(data) => Ok(Response::new(proto::ScreenshotResponse {
+                request_id,
+                success: true,
+                data,
+                error_message: String::new(),
+            })),
+            Err(e) => Ok(Response::new(proto::ScreenshotResponse {
+                request_id,
+                success: false,
+                data: Vec::new(),
+                error_message: e.to_string(),
+            })),
+        }
+    }
+
+    async fn prearm_network_tracing(&self, req: &proto::SetDeviceRequest) {
+        // Symmetric to the iOS pre-arm: for Android with tracing
+        // enabled, install the MITM CA now — during setup, before the
+        // first app launch — so the app under test forks from a zygote
+        // that already trusts the cert (Android 14+ injects into the
+        // zygote mount namespace, which only future forks inherit). This
+        // is what spares the first HTTPS request on a freshly-booted
+        // device. See `ensure_android_ca_installed`.
+        if req.network_tracing_enabled {
+            self.svc.ensure_android_ca_installed(&req.serial).await;
+        }
+    }
 }

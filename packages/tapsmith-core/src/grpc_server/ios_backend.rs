@@ -1501,4 +1501,72 @@ impl DeviceBackend for IosBackend<'_> {
             error_message: String::new(),
         }))
     }
+
+    async fn take_screenshot(
+        &self,
+        request_id: String,
+    ) -> Result<Response<proto::ScreenshotResponse>, Status> {
+        let command = AgentCommand::Screenshot {};
+        // Use a short timeout — screenshots are best-effort for tracing
+        // and should not block for 30s if the agent is busy.
+        match self
+            .svc
+            .send_agent_command_with_timeout(&command, 5000)
+            .await
+        {
+            Ok(resp) if resp.success => {
+                let b64_str = resp.data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+                use base64::Engine;
+                match base64::engine::general_purpose::STANDARD.decode(b64_str) {
+                    Ok(data) => Ok(Response::new(proto::ScreenshotResponse {
+                        request_id,
+                        success: true,
+                        data,
+                        error_message: String::new(),
+                    })),
+                    Err(e) => Ok(Response::new(proto::ScreenshotResponse {
+                        request_id,
+                        success: false,
+                        data: Vec::new(),
+                        error_message: format!("Failed to decode screenshot data: {e}"),
+                    })),
+                }
+            }
+            Ok(resp) => Ok(Response::new(proto::ScreenshotResponse {
+                request_id,
+                success: false,
+                data: Vec::new(),
+                error_message: resp
+                    .error
+                    .unwrap_or_else(|| "Screenshot failed".to_string()),
+            })),
+            Err(status) => Ok(Response::new(proto::ScreenshotResponse {
+                request_id,
+                success: false,
+                data: Vec::new(),
+                error_message: status.message().to_string(),
+            })),
+        }
+    }
+
+    async fn prearm_network_tracing(&self, req: &proto::SetDeviceRequest) {
+        // For physical iOS with tracing enabled, pre-start the Wi-Fi
+        // MITM proxy immediately so any subsequent devicectl install
+        // / launch / xcodebuild invocation can't race the phone's
+        // OCSP check (which routes through the Wi-Fi proxy port on
+        // the Mac). When tracing is off, iOS has no reason to route
+        // through our proxy at all, so we skip the pre-start entirely
+        // — this is the single biggest basic-track failure reduction.
+        #[cfg(target_os = "macos")]
+        if req.network_tracing_enabled && self.svc.is_active_ios_physical().await {
+            self.svc.ensure_ios_physical_proxy(&req.serial).await;
+            // Push the current trace.networkHosts allowlist into
+            // the live proxy so the next `/tapsmith.pac` fetch from
+            // iOS reflects the user's tapsmith.config.ts exactly.
+            // Safe to call while the proxy is serving traffic.
+            if let Some(proxy) = self.svc.network_proxy.read().await.as_ref() {
+                proxy.set_network_hosts(req.network_hosts.clone()).await;
+            }
+        }
+    }
 }
