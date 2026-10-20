@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { Device } from '../device.js';
+import { isTestEndedError, runInAttemptContext } from '../attempt-fence.js';
 import { selectorToProto } from '../selectors.js';
 import type { TapsmithGrpcClient, ActionResponse } from '../grpc-client.js';
 import { TraceCollector } from '../trace/trace-collector.js';
@@ -623,6 +624,121 @@ describe('Device.route()', () => {
 
     await expect(device.route('**/posts*', async () => undefined)).resolves.toBeUndefined();
     expect(stream.writes).toHaveLength(1);
+  });
+
+  // PILOT-775: mocking needs no trace config — the runner arms an on-demand
+  // start and the first route() makes it.
+  describe('on-demand network capture (PILOT-775)', () => {
+    const makeOnDemand = (results: Array<{ success: boolean; errorMessage: string }>) => {
+      const stream = new FakeRouteStream();
+      const startNetworkCapture = vi.fn(async () => ({ requestId: '1', proxyPort: 1, ...(results.shift() ?? { success: true, errorMessage: '' }) }));
+      const client = makeMockClient({
+        startNetworkCapture,
+        networkRouteStream: vi.fn(
+          () => stream as unknown as ReturnType<TapsmithGrpcClient['networkRouteStream']>,
+        ),
+      });
+      const device = new Device(client);
+      const arm = (): void => device._setOnDemandNetworkCapture(async () => { await device._startNetworkCapture(); });
+      return { device, startNetworkCapture, arm };
+    };
+
+    it('starts capture once for concurrent first calls, then not again while it runs', async () => {
+      const { device, startNetworkCapture, arm } = makeOnDemand([]);
+      arm();
+      await Promise.all([
+        device.route('**/a', async () => undefined),
+        device.route('**/b', async () => undefined),
+      ]);
+      await device.route('**/c', async () => undefined);
+
+      expect(startNetworkCapture).toHaveBeenCalledTimes(1);
+      expect(device._networkProxyRunning).toBe(true);
+      expect(device._takeProxyStartedOnDemand()).toBe(true);
+    });
+
+    it('uses a proxy kept from an earlier test as it is, without restarting it mid-test', async () => {
+      // A restart resets the daemon's capture state, including the hosts it
+      // learned to tunnel for clients that reject its certificate.
+      const { device, startNetworkCapture, arm } = makeOnDemand([]);
+      arm();
+      await device.route('**/a', async () => undefined);
+      device._takeProxyStartedOnDemand();
+      await device._stopNetworkCapture({ keepRunning: true });
+
+      arm();
+      await device.route('**/b', async () => undefined);
+
+      expect(startNetworkCapture).toHaveBeenCalledTimes(1);
+      expect(device._takeProxyStartedOnDemand()).toBe(false);
+    });
+
+    it('fails route() with the reason, tries once per arm, and tries again once re-armed', async () => {
+      const { device, startNetworkCapture, arm } = makeOnDemand([
+        { success: false, errorMessage: 'Network Extension not approved' },
+        { success: true, errorMessage: '' },
+      ]);
+      arm();
+      await expect(device.route('**/a', async () => undefined))
+        .rejects.toThrow('Network capture disabled: Network Extension not approved');
+      await expect(device.route('**/a', async () => undefined))
+        .rejects.toThrow('Network capture disabled: Network Extension not approved');
+      expect(startNetworkCapture).toHaveBeenCalledTimes(1);
+
+      arm();
+      await expect(device.route('**/a', async () => undefined)).resolves.toBeUndefined();
+      expect(startNetworkCapture).toHaveBeenCalledTimes(2);
+    });
+
+    it('does not register a route whose test ended while the on-demand start ran', async () => {
+      const stream = new FakeRouteStream();
+      const token = { closed: false };
+      const client = makeMockClient({
+        startNetworkCapture: vi.fn(async () => {
+          token.closed = true; // the test timed out meanwhile
+          return { requestId: '1', proxyPort: 1, success: true, errorMessage: '' };
+        }),
+        networkRouteStream: vi.fn(() => stream as unknown as ReturnType<TapsmithGrpcClient['networkRouteStream']>),
+      });
+      const device = new Device(client);
+      device._setOnDemandNetworkCapture(async () => { await device._startNetworkCapture(); });
+
+      const err = await runInAttemptContext(token, () => device.route('**/a', async () => undefined).then(() => undefined, (e: unknown) => e));
+
+      expect(isTestEndedError(err)).toBe(true);
+      expect(stream.writes.filter((m) => typeof m === 'object' && m !== null && 'registerRoute' in m)).toEqual([]);
+      expect(device._takeRouteRegistrations()).toBe(0);
+    });
+
+    it('starts capture on demand for device.on() too', async () => {
+      const { device, startNetworkCapture, arm } = makeOnDemand([]);
+      arm();
+      device.on('request', () => {});
+      await vi.waitFor(() => expect(device._networkProxyRunning).toBe(true));
+      expect(startNetworkCapture).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not retry on demand a trace's own start that failed in the same arm", async () => {
+      const { device, startNetworkCapture, arm } = makeOnDemand([
+        { success: false, errorMessage: 'proxy unavailable' },
+      ]);
+      arm();
+      await device._startNetworkCapture();
+      await expect(device.route('**/a', async () => undefined))
+        .rejects.toThrow('Network capture disabled: proxy unavailable');
+      expect(startNetworkCapture).toHaveBeenCalledTimes(1);
+    });
+
+    it('starts nothing when the runner has not armed it, or cleared it', async () => {
+      const { device, startNetworkCapture, arm } = makeOnDemand([]);
+      await device.route('**/a', async () => undefined);
+      arm();
+      device._setOnDemandNetworkCapture(null);
+      await device.route('**/b', async () => undefined);
+
+      expect(startNetworkCapture).not.toHaveBeenCalled();
+      expect(device._networkProxyRunning).toBe(false);
+    });
   });
 
   it('counts successful registrations for the runner and resets when taken (PILOT-517)', async () => {
