@@ -349,8 +349,8 @@ class CommandHandler {
     /// samples; a false positive merely costs a cold relaunch, never a
     /// wrong verdict.
     private func displayAppearsBlack() -> Bool {
-        let image = XCUIScreen.main.screenshot().image
-        guard let cgImage = image.cgImage, cgImage.width > 8, cgImage.height > 8 else {
+        guard let cgImage = PlatformCompat.screenshotCGImage(XCUIScreen.main.screenshot()),
+              cgImage.width > 8, cgImage.height > 8 else {
             return false
         }
         let sampleWidth = 64
@@ -1402,6 +1402,20 @@ class CommandHandler {
                     waitForKeyboardAppearance(maxWait: 1.0)
                 }
                 let element = try resolveElement(selectorParams)
+                #if os(macOS)
+                // macOS has no software keyboard to wait for, and typing into
+                // the application element goes nowhere (its frame is null).
+                // XCUIElement.typeText on macOS does not focus the element (it
+                // fails "Neither element nor any descendant has keyboard
+                // focus"), so click it first.
+                // SPIKE: ignores typingDelayMs and the cover check.
+                if !isFocusedOnlySelector {
+                    let field = try getXCUIElement(element.elementId)
+                    field.click()
+                    field.typeText(text)
+                    return ["success": true]
+                }
+                #endif
                 if !isFocusedOnlySelector {
                     // Half the budget at most for a cover, so the typing
                     // after it still fits the daemon's read timeout.
@@ -1475,7 +1489,7 @@ class CommandHandler {
             if (element.text ?? "").isEmpty {
                 let xc = try? getXCUIElement(element.elementId)
                 if let xc = xc {
-                    let live = (xc.value as? String) ?? ""
+                    let live = PlatformCompat.valueString(xc.value) ?? ""
                     if live.isEmpty || live == (element.hint ?? "") {
                         return ["success": true]
                     }
@@ -1931,11 +1945,11 @@ class CommandHandler {
         case "setClipboard":
             let text = params["text"] as? String ?? ""
             lastClipboardText = text
-            UIPasteboard.general.string = text
+            PlatformCompat.setClipboard(text)
             return ["success": true]
 
         case "getClipboard":
-            let text = UIPasteboard.general.string ?? lastClipboardText
+            let text = PlatformCompat.clipboardText() ?? lastClipboardText
             return ["text": text]
 
         // ─── App Lifecycle ───
@@ -1990,7 +2004,10 @@ class CommandHandler {
             let state: String
             switch targetApp.state {
             case .notRunning: state = "stopped"
-            case .runningBackground, .runningBackgroundSuspended: state = "background"
+            case .runningBackground: state = "background"
+            #if os(iOS)
+            case .runningBackgroundSuspended: state = "background"
+            #endif
             case .runningForeground: state = "foreground"
             case .unknown: state = "stopped"
             @unknown default: state = "stopped"
@@ -2190,6 +2207,9 @@ class CommandHandler {
         // ─── Orientation ───
 
         case "setOrientation":
+            #if os(macOS)
+            throw PlatformCompat.unsupportedOnMacOS("setOrientation")
+            #else
             let orientation = params["orientation"] as? String ?? "portrait"
             let target: UIDeviceOrientation
             switch orientation.lowercased() {
@@ -2216,14 +2236,19 @@ class CommandHandler {
             }
             snapshotFinder.invalidateScreenSize()
             return ["success": true]
+            #endif
 
         case "getOrientation":
+            #if os(macOS)
+            throw PlatformCompat.unsupportedOnMacOS("getOrientation")
+            #else
             let orientation: String
             switch XCUIDevice.shared.orientation {
             case .landscapeLeft, .landscapeRight: orientation = "landscape"
             default: orientation = "portrait"
             }
             return ["orientation": orientation]
+            #endif
 
         // ─── Keyboard ───
 
@@ -2246,8 +2271,7 @@ class CommandHandler {
             // attaches (see `dismissOpenURLDialogAndWaitForContent`).
             guard let kbSnapshot = try? snapshotFinder.takeSnapshot() else {
                 let appState = safeAppState(app)
-                if appState == .notRunning || appState == .runningBackground
-                    || appState == .runningBackgroundSuspended {
+                if appState == .notRunning || appState.isBackground {
                     snapshotFinder.clearFocusedTextInputHint()
                     return ["success": true]
                 }
@@ -2286,13 +2310,7 @@ class CommandHandler {
             return ["success": true]
 
         case "getColorScheme":
-            let style = UITraitCollection.current.userInterfaceStyle
-            let scheme: String
-            switch style {
-            case .dark: scheme = "dark"
-            default: scheme = "light"
-            }
-            return ["scheme": scheme]
+            return ["scheme": PlatformCompat.isDarkMode() ? "dark" : "light"]
 
         // ─── Permissions ───
 

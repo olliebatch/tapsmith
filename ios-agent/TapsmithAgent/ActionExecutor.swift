@@ -39,7 +39,11 @@ class ActionExecutor {
     /// the repeat `isHittable` round-trip.
     func tapHittable(_ element: XCUIElement) {
         waitForStableFrame(element)
+        #if os(macOS)
+        element.click()
+        #else
         element.tap()
+        #endif
     }
 
     /// Wait until two consecutive reads of the element's live frame agree, or
@@ -59,6 +63,19 @@ class ActionExecutor {
 
     /// Tap at specific screen coordinates using event synthesis.
     func tapCoordinates(x: Int, y: Int) {
+        #if os(macOS)
+        // XCTest's private event-synthesis IPC is not available on macOS
+        // (_XCT_synthesizeEvent:completion: is missing from the testmanagerd
+        // proxy), so click through the public mouse API. The application
+        // element has no usable frame on macOS (a coordinate from it is
+        // infinite), so anchor on the window and offset to the global point.
+        let window = app.windows.firstMatch
+        let frame = window.frame
+        window.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            .withOffset(CGVector(dx: CGFloat(x) - frame.minX, dy: CGFloat(y) - frame.minY))
+            .click()
+        return
+        #endif
         if !EventSynthesizer.tap(at: CGPoint(x: x, y: y)) {
             NSLog("[ActionExecutor] Event synthesis failed, falling back to XCUICoordinate.tap()")
             let normalized = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
@@ -140,6 +157,19 @@ class ActionExecutor {
     @discardableResult
     func typeViaEventSynthesizer(_ text: String, delayMs: Int = 0) -> Bool {
         guard !text.isEmpty else { return true }
+        #if os(macOS)
+        // _XCT_sendString is not available on macOS; type through the public
+        // API into whatever has keyboard focus.
+        if delayMs > 0 {
+            for char in text {
+                app.typeText(String(char))
+                Thread.sleep(forTimeInterval: TimeInterval(delayMs) / 1000.0)
+            }
+        } else {
+            app.typeText(text)
+        }
+        return true
+        #endif
 
         if delayMs > 0 {
             let delay = TimeInterval(delayMs) / 1000.0
@@ -372,13 +402,15 @@ class ActionExecutor {
         if option.waitForExistence(timeout: 3) {
             option.tap()
         } else {
-            // Try in picker wheels
+            // Try in picker wheels (iOS only; macOS has none)
+            #if os(iOS)
             let pickerWheel = app.pickerWheels.firstMatch
             if pickerWheel.exists {
                 pickerWheel.adjust(toPickerWheelValue: optionText)
-            } else {
-                throw AgentError.elementNotFound("Option '\(optionText)' not found in dropdown")
+                return
             }
+            #endif
+            throw AgentError.elementNotFound("Option '\(optionText)' not found in dropdown")
         }
     }
 
@@ -479,7 +511,11 @@ class ActionExecutor {
     func pressKey(_ key: String) throws {
         switch key.lowercased() {
         case "home":
+            #if os(macOS)
+            throw PlatformCompat.unsupportedOnMacOS("The home button")
+            #else
             XCUIDevice.shared.press(.home)
+            #endif
         case "volume_up", "volume_down":
             // Volume buttons are not available in the iOS Simulator.
             // On a real device this could use XCUIDevice.shared.press(.volumeUp/.volumeDown)

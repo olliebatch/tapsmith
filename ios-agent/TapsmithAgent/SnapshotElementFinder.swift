@@ -287,7 +287,7 @@ class SnapshotElementFinder {
             let inTabBar = nodeDict[SnapshotElementFinder.inTabBarKey] as? Bool ?? false
             let role = RoleMapping.resolveRole(for: elType, traits: traits, inTabBar: inTabBar)
             let isEnabled = nodeDict["enabled"] as? Bool ?? true
-            let value = nodeDict["value"] as? String
+            let value = PlatformCompat.valueString(nodeDict["value"])
             let isSelected = nodeDict["selected"] as? Bool ?? false
             let isChecked = checkedState(
                 for: elType,
@@ -845,7 +845,7 @@ class SnapshotElementFinder {
                 label: children[i]["label"] as? String ?? "",
                 identifier: children[i]["identifier"] as? String ?? "",
                 title: children[i]["title"] as? String ?? "",
-                value: children[i]["value"] as? String ?? ""
+                value: PlatformCompat.valueString(children[i]["value"]) ?? ""
             ))
             numberDescendants(of: &children[i], into: &nodes)
         }
@@ -998,7 +998,7 @@ class SnapshotElementFinder {
                     value: child["value"] as? String ?? ""
                 ) { continue }
                 let ownText: String?
-                if let v = child["value"] as? String, !v.isEmpty {
+                if let v = PlatformCompat.valueString(child["value"]), !v.isEmpty {
                     ownText = v
                 } else if let t = child["title"] as? String, !t.isEmpty {
                     ownText = t
@@ -1235,7 +1235,7 @@ class SnapshotElementFinder {
         let label = node["label"] as? String ?? ""
         let title = node["title"] as? String ?? ""
         let identifier = node["identifier"] as? String ?? ""
-        let value = node["value"] as? String ?? ""
+        let value = PlatformCompat.valueString(node["value"]) ?? ""
         let placeholderValue = node["placeholderValue"] as? String ?? ""
         let elTypeRaw = parseUInt(node["elementType"]) ?? 0
         let elType = XCUIElement.ElementType(rawValue: elTypeRaw) ?? .other
@@ -1474,7 +1474,7 @@ class SnapshotElementFinder {
             elementType: parseUInt(dict["elementType"]) ?? 0,
             label: (dict["label"] as? String) ?? (dict["title"] as? String ?? ""),
             identifier: dict["identifier"] as? String ?? "",
-            value: (dict["value"] as? String) ?? "",
+            value: PlatformCompat.valueString(dict["value"]) ?? "",
             placeholderValue: dict["placeholderValue"] as? String ?? "",
             isEnabled: dict["enabled"] as? Bool ?? true,
             frame: parseFrame(dict),
