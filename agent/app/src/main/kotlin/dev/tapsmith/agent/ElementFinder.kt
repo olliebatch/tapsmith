@@ -595,21 +595,12 @@ class ElementFinder(
         val candidates = enumerate(selector, parent)
         val enumeratedAt = SystemClock.uptimeMillis()
 
-        val matches = mutableListOf<ElementInfo>()
-        var examined = 0
         var extractMs = 0L
-        for (obj in candidates) {
-            if (matches.size >= limit) break
-            // Each candidate can cost an accessibility round-trip on a busy
-            // app: stop once the daemon has given up (PILOT-605).
-            CommandCancellation.checkpoint()
-            examined++
-            val node = snapshotOf(obj, fresh)
-            if (!matchesSelector(node, selector, fresh) || !matchesStateFilters(node, selector)) continue
-            val extractStart = SystemClock.uptimeMillis()
-            matches.add(cacheAndConvert(obj, node, fresh))
-            extractMs += SystemClock.uptimeMillis() - extractStart
-        }
+        val (matches, examined) =
+            matchCandidates(candidates, selector, fresh, limit) { obj, node ->
+                val extractStart = SystemClock.uptimeMillis()
+                cacheAndConvert(obj, node, fresh).also { extractMs += SystemClock.uptimeMillis() - extractStart }
+            }
         val doneAt = SystemClock.uptimeMillis()
         android.util.Log.d(
             FIND_LOG_TAG,
@@ -620,6 +611,102 @@ class ElementFinder(
                 (if (fresh) "" else " [cache not cleared: per-node refresh]"),
         )
         return matches
+    }
+
+    /**
+     * The match step of a find: every candidate the walk enumerated that the
+     * selector's non-native parts and state filters accept, in tree order,
+     * up to [limit]. Returns the matches and how many candidates were read.
+     */
+    private inline fun matchCandidates(
+        candidates: List<UiObject2>,
+        selector: ElementSelector,
+        fresh: Boolean,
+        limit: Int,
+        refreshed: MutableMap<AccessibilityNodeInfo, AccessibilityNodeInfo>? = null,
+        convert: (UiObject2, AccessibilityNodeInfo) -> ElementInfo,
+    ): Pair<List<ElementInfo>, Int> {
+        val matches = mutableListOf<ElementInfo>()
+        var examined = 0
+        for (obj in candidates) {
+            if (matches.size >= limit) break
+            // Each candidate can cost an accessibility round-trip on a busy
+            // app: stop once the daemon has given up (PILOT-605).
+            CommandCancellation.checkpoint()
+            examined++
+            val node = snapshotOf(obj, fresh, refreshed)
+            if (!matchesSelector(node, selector, fresh) || !matchesStateFilters(node, selector)) continue
+            matches.add(convert(obj, node))
+        }
+        return matches to examined
+    }
+
+    /**
+     * Evaluate several selectors against the current UI (PILOT-848), by the
+     * same enumerate-and-match steps as [findElements], so locator
+     * suggestions and match counts are decided by the rules tests run with.
+     *
+     * - One accessibility-cache clear for the batch, and each node read at
+     *   most once ([refreshed]): below API 34 there is no cache to clear and
+     *   every read is a round-trip, while a screen's candidates walk the same
+     *   nodes over and over.
+     * - Never waits, and never caches a match (the returned ids are empty),
+     *   so evaluating a screen's worth of candidates can't evict the handles
+     *   of a test running on the same agent.
+     * - A selector that fails (an invalid RegExp, a missing criterion, a
+     *   tree still re-rendering after every retry) fails only its own entry.
+     */
+    fun evaluateSelectors(selectors: List<Result<ElementSelector>>): List<Result<List<ElementInfo>>> {
+        val startedAt = SystemClock.uptimeMillis()
+        var fresh = clearAccessibilityCache()
+        val refreshed = HashMap<AccessibilityNodeInfo, AccessibilityNodeInfo>()
+        val maxAttempts = STALE_RETRY_ATTEMPTS.coerceAtLeast(1)
+        val results =
+            selectors.map { parsed ->
+                CommandCancellation.checkpoint()
+                val selector = parsed.getOrElse { return@map Result.failure(it) }
+                var outcome: Result<List<ElementInfo>> = Result.failure(StaleObjectException())
+                for (attempt in 0 until maxAttempts) {
+                    try {
+                        outcome = Result.success(evaluateOne(selector, fresh, refreshed))
+                        break
+                    } catch (e: StaleObjectException) {
+                        // Retry this selector against a re-read tree; the
+                        // others keep what they found.
+                        outcome = Result.failure(e)
+                        if (attempt < maxAttempts - 1) {
+                            CommandCancellation.sleep(STALE_RETRY_DELAY_MS)
+                            fresh = clearAccessibilityCache()
+                            refreshed.clear()
+                        }
+                    } catch (e: CommandCancelledException) {
+                        throw e
+                    } catch (e: Exception) {
+                        outcome = Result.failure(e)
+                        break
+                    }
+                }
+                outcome
+            }
+        android.util.Log.d(
+            FIND_LOG_TAG,
+            "evaluateSelectors: ${selectors.size} selectors in ${SystemClock.uptimeMillis() - startedAt}ms" +
+                (if (fresh) "" else " [cache not cleared: ${refreshed.size} nodes refreshed once each]"),
+        )
+        return results
+    }
+
+    private fun evaluateOne(
+        selector: ElementSelector,
+        fresh: Boolean,
+        refreshed: MutableMap<AccessibilityNodeInfo, AccessibilityNodeInfo>,
+    ): List<ElementInfo> {
+        if (selector.xpath != null) {
+            return findByXPath(selector.xpath).map { it.copy(elementId = "") }
+        }
+        return matchCandidates(enumerate(selector, null), selector, fresh, Int.MAX_VALUE, refreshed) { obj, node ->
+            toElementInfo(obj, node, "", fresh).first
+        }.first
     }
 
     /**
@@ -990,13 +1077,20 @@ class ElementFinder(
      * for every attribute this find reads, where UiObject2's getters made
      * one per attribute. Falls back to a refreshed read if the bundled
      * UIAutomator no longer has the field, which `FindRulesTest` pins.
+     * With [refreshed] (a batch of finds over one screen), a node refreshed
+     * once is reused, keyed by the node the walk captured.
      */
     private fun snapshotOf(
         obj: UiObject2,
         fresh: Boolean,
+        refreshed: MutableMap<AccessibilityNodeInfo, AccessibilityNodeInfo>? = null,
     ): AccessibilityNodeInfo {
-        val walked = if (fresh) cachedNodeField?.get(obj) as? AccessibilityNodeInfo else null
-        return walked ?: nodeInfoFor(obj) ?: throw StaleObjectException()
+        val walked = cachedNodeField?.get(obj) as? AccessibilityNodeInfo
+        if (fresh && walked != null) return walked
+        if (refreshed != null && walked != null) refreshed[walked]?.let { return it }
+        val node = nodeInfoFor(obj) ?: throw StaleObjectException()
+        if (refreshed != null && walked != null) refreshed[walked] = node
+        return node
     }
 
     /**

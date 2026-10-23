@@ -6,6 +6,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { selectorToProto } from '../selectors.js';
+import type { Selector } from '../selectors.js';
 import type { DeviceInfoProto, ElementInfo, TapsmithGrpcClient } from '../grpc-client.js';
 import type { TestDispatcher } from '../mcp/test-dispatcher.js';
 import { summarizeResult } from '../mcp/events.js';
@@ -69,6 +70,7 @@ function makeElement(overrides: Partial<ElementInfo> = {}): ElementInfo {
 interface FakeDaemon {
   client: TapsmithGrpcClient
   findElements: ReturnType<typeof vi.fn>
+  evaluateSelectors: ReturnType<typeof vi.fn>
   tap: ReturnType<typeof vi.fn>
   typeText: ReturnType<typeof vi.fn>
   clearText: ReturnType<typeof vi.fn>
@@ -90,6 +92,8 @@ function makeDaemon(options: {
   hierarchyXml?: string
   hierarchyError?: string
   findError?: string
+  /** What the agent matches per selector when evaluating; default: `elements`. */
+  evaluate?: (selector: Selector) => ElementInfo[] | Error
   screenshot?: Buffer
   screenshotError?: string
   actionError?: string
@@ -108,6 +112,14 @@ function makeDaemon(options: {
       requestId: '1',
       elements: options.elements ?? [],
       errorMessage: options.findError ?? '',
+    })),
+    evaluateSelectors: vi.fn(async (selectors: Selector[]) => ({
+      requestId: '1',
+      errorMessage: options.findError ?? '',
+      results: options.findError ? [] : selectors.map((sel) => {
+        const r = options.evaluate ? options.evaluate(sel) : (options.elements ?? []);
+        return r instanceof Error ? { elements: [], errorMessage: r.message } : { elements: r, errorMessage: '' };
+      }),
     })),
     tap: action('tap'),
     typeText: action('typeText'),
@@ -179,9 +191,25 @@ function text(res: CallToolResult): string {
 /** The iOS sign-in screen the locator fixtures use, as agent hierarchy XML. */
 const SIGN_IN_XML = `
 <XCUIElementTypeApplication type="XCUIElementTypeApplication">
-  <XCUIElementTypeStaticText type="XCUIElementTypeStaticText" label="Sign in to continue to DreamSpinner" clickable="false" />
-  <XCUIElementTypeButton type="XCUIElementTypeButton" label="Sign in" clickable="true" />
+  <XCUIElementTypeStaticText type="XCUIElementTypeStaticText" label="Sign in to continue to DreamSpinner" clickable="false" bounds="[0,100][390,140]" />
+  <XCUIElementTypeButton type="XCUIElementTypeButton" label="Sign in" clickable="true" bounds="[20,200][370,250]" />
 </XCUIElementTypeApplication>`;
+
+/** The sign-in screen's two elements as the agent reports them. */
+const SIGN_IN_TEXT = { text: 'Sign in to continue to DreamSpinner', className: 'XCUIElementTypeStaticText', bounds: { left: 0, top: 100, right: 390, bottom: 140 } };
+const SIGN_IN_BUTTON = { text: 'Sign in', className: 'XCUIElementTypeButton', role: 'button', bounds: { left: 20, top: 200, right: 370, bottom: 250 } };
+
+/** A fake agent for the sign-in screen: substring text matches both, the rest is exact. */
+function signInAgent(sel: Selector): ElementInfo[] {
+  const k = sel.kind;
+  const all = [SIGN_IN_TEXT, SIGN_IN_BUTTON];
+  let hits: typeof all = [];
+  if (k.type === 'textContains') hits = all.filter((e) => e.text.toLowerCase().includes(k.value.toLowerCase()));
+  else if (k.type === 'text') hits = all.filter((e) => e.text === k.value);
+  else if (k.type === 'role') hits = k.value.role === 'button' && (!k.value.name || k.value.name === 'Sign in') ? [SIGN_IN_BUTTON] : [];
+  else if (k.type === 'className') hits = all.filter((e) => e.className === k.value);
+  return hits.map((h) => makeElement({ elementId: '', ...h }));
+}
 
 beforeEach(() => {
   hoisted.client = makeDaemon().client;
@@ -195,7 +223,7 @@ beforeEach(() => {
 
 describe('tapsmith_snapshot', () => {
   it('returns the tree and the locators an agent is meant to copy', async () => {
-    hoisted.client = makeDaemon({ hierarchyXml: SIGN_IN_XML }).client;
+    hoisted.client = makeDaemon({ hierarchyXml: SIGN_IN_XML, evaluate: signInAgent }).client;
     const res = await callTool('tapsmith_snapshot');
     expect(res.isError).toBeFalsy();
     const out = text(res);
@@ -204,13 +232,97 @@ describe('tapsmith_snapshot', () => {
     expect(out).toContain('device.getByRole("button", { name: "Sign in" })');
   });
 
+  it('offers only what the agent resolves to that element (PILOT-848)', async () => {
+    // The agent finds no button here (as on Compose, PILOT-833): the role
+    // suggestion the hierarchy alone would make must not be offered.
+    const daemon = makeDaemon({
+      hierarchyXml: SIGN_IN_XML,
+      evaluate: (sel) => (sel.kind.type === 'role' ? [] : signInAgent(sel)),
+    });
+    hoisted.client = daemon.client;
+    const out = text(await callTool('tapsmith_snapshot'));
+    expect(out).not.toContain('getByRole("button"');
+    // The ambiguous substring is upgraded to the exact text the agent resolves uniquely.
+    expect(out).toContain('device.getByText("Sign in", { exact: true })');
+    expect(daemon.findElements).not.toHaveBeenCalled();
+  });
+
+  it('says the screen may have changed when the agent resolves nothing to its element', async () => {
+    // The dump and the agent's check saw different screens (a transition):
+    // every candidate resolves elsewhere.
+    const moved = (sel: Selector) => signInAgent(sel).map((e) => ({ ...e, bounds: { ...e.bounds!, top: e.bounds!.top + 300, bottom: e.bounds!.bottom + 300 } }));
+    hoisted.client = makeDaemon({ hierarchyXml: SIGN_IN_XML, evaluate: moved }).client;
+    const res = await callTool('tapsmith_snapshot');
+    expect(res.isError).toBeFalsy();
+    const out = text(res);
+    expect(out).toContain('button "Sign in"');
+    expect(out).not.toContain('## Suggested Locators');
+    expect(out).toContain('the screen may have been changing. Take the snapshot again.');
+  });
+
+  it('says some listed elements were not on screen when the agent checked them (the screen changed)', async () => {
+    // The dump shows the sign-in screen; by the check the static text is gone.
+    const gone = (sel: Selector) => signInAgent(sel).filter((e) => e.text !== 'Sign in to continue to DreamSpinner');
+    hoisted.client = makeDaemon({ hierarchyXml: SIGN_IN_XML, evaluate: gone }).client;
+    const out = text(await callTool('tapsmith_snapshot'));
+    expect(out).toContain('## Suggested Locators');
+    expect(out).toContain('(1 listed element was not on screen when the device agent checked it, so it has no suggested locator; the screen may have changed. Take the snapshot again.)');
+  });
+
+  it('checks a big iOS screen in one call (an iOS agent captures once per call)', async () => {
+    const rows = Array.from({ length: 30 }, (_, i) =>
+      `  <XCUIElementTypeStaticText type="XCUIElementTypeStaticText" label="Row ${i}" bounds="[0,${i * 50}][390,${i * 50 + 40}]" />`).join('\n');
+    // Shaped like the iOS agent's dump: wrapped in <hierarchy>, like Android's.
+    const daemon = makeDaemon({ hierarchyXml: `<?xml version="1.0" encoding="UTF-8"?>\n<hierarchy>\n<XCUIElementTypeApplication type="XCUIElementTypeApplication">\n${rows}\n</XCUIElementTypeApplication>\n</hierarchy>` });
+    hoisted.client = daemon.client;
+    await callTool('tapsmith_snapshot');
+    expect(daemon.evaluateSelectors.mock.calls[0][0].length).toBeGreaterThan(40);
+  });
+
+  it('says nothing about refs when the screen has no element to suggest for', async () => {
+    hoisted.client = makeDaemon({ hierarchyXml: '<hierarchy><node class="android.widget.FrameLayout" bounds="[0,0][10,10]" /></hierarchy>' }).client;
+    expect(text(await callTool('tapsmith_snapshot'))).not.toContain('No suggested locators');
+  });
+
+  it('keeps the activity-feed count right when checking stopped partway', async () => {
+    const daemon = makeDaemon({ hierarchyXml: SIGN_IN_XML, evaluate: signInAgent });
+    let calls = 0;
+    const real = daemon.evaluateSelectors.getMockImplementation() as (selectors: Selector[]) => Promise<unknown>;
+    daemon.evaluateSelectors.mockImplementation(async (selectors: Selector[]) => {
+      calls++;
+      // The first chunk is answered; checking stops at the next one.
+      return calls === 1 ? real(selectors) : { requestId: '1', results: [], errorMessage: 'Agent command timed out' };
+    });
+    hoisted.client = daemon.client;
+    const out = text(await callTool('tapsmith_snapshot'));
+    // The candidates were all checked; only the variants that would pin the
+    // ambiguous ones were not, so those fall back to a position.
+    expect(out).toContain('(Some suggestions are pinned by position (.first()/.nth()/.last()) because the device agent stopped checking more specific ones: Agent command timed out)');
+    expect(out).not.toContain('Some elements have no suggested locator');
+    const refs = out.split('\n').filter((l) => /^\[\d+\] /.test(l)).length;
+    expect(refs).toBeGreaterThan(0);
+    expect(summarizeResult('tapsmith_snapshot', out)).toMatch(new RegExp(`, ${refs} locators$`));
+  });
+
+  it('says why there are no refs when the agent cannot check them, and still shows the tree', async () => {
+    const daemon = makeDaemon({ hierarchyXml: SIGN_IN_XML });
+    daemon.evaluateSelectors.mockResolvedValue({ requestId: '1', results: [], errorMessage: 'Unknown method: evaluateSelectors' });
+    hoisted.client = daemon.client;
+    const res = await callTool('tapsmith_snapshot');
+    expect(res.isError).toBeFalsy();
+    const out = text(res);
+    expect(out).toContain('button "Sign in"');
+    expect(out).not.toContain('## Suggested Locators');
+    expect(out).toContain('(No suggested locators: the device agent stopped checking them: Unknown method: evaluateSelectors)');
+  });
+
   // The section heading is a literal in two places: emitted by snapshot.ts and
   // parsed back out by summarizeResult (mcp/events.ts) for the activity feed.
   // Each side has its own test with its own copy of the string, so editing one
   // leaves both green while the feed silently reports 0 locators. Pipe the real
   // snapshot output through the real summariser so the two stay tied.
   it('produces output the activity-feed summariser can still count', async () => {
-    hoisted.client = makeDaemon({ hierarchyXml: SIGN_IN_XML }).client;
+    hoisted.client = makeDaemon({ hierarchyXml: SIGN_IN_XML, evaluate: signInAgent }).client;
     const out = text(await callTool('tapsmith_snapshot'));
 
     // Parse the count rather than substring-matching it: '10 locators' contains
@@ -716,7 +828,7 @@ describe('tapsmith_test_locator', () => {
     const res = await callTool('tapsmith_test_locator', { locator: 'device.getByRole("heading", { name: "A", level: 2 })' });
     expect(res.isError).toBe(true);
     expect(text(res)).toBe('Invalid locator: "device.getByRole("heading", { name: "A", level: 2 })": unsupported option "level".');
-    expect(daemon.findElements).not.toHaveBeenCalled();
+    expect(daemon.evaluateSelectors).not.toHaveBeenCalled();
   });
 
   it('refuses a chained call instead of counting the unscoped getter (PILOT-660)', async () => {
@@ -727,7 +839,7 @@ describe('tapsmith_test_locator', () => {
     expect(res.isError).toBe(true);
     expect(text(res)).toBe(`Invalid locator: "${locator}": unsupported chained call .getByText() — `
       + 'a locator string here is one getter, optionally followed by .first(), .last() or .nth(n).');
-    expect(daemon.findElements).not.toHaveBeenCalled();
+    expect(daemon.evaluateSelectors).not.toHaveBeenCalled();
   });
 
   it('surfaces a daemon error instead of reporting no match', async () => {
@@ -735,6 +847,22 @@ describe('tapsmith_test_locator', () => {
     const res = await callTool('tapsmith_test_locator', { locator: 'device.getByText("Sign in")' });
     expect(res.isError).toBe(true);
     expect(text(res)).toBe('Error: agent not responding');
+  });
+
+  it('asks the agent to evaluate the locator once, without waiting (PILOT-848)', async () => {
+    const daemon = makeDaemon({ elements: [makeElement({ text: 'Sign in' })] });
+    hoisted.client = daemon.client;
+    await callTool('tapsmith_test_locator', { locator: 'device.getByText("Sign in")' });
+    expect(daemon.evaluateSelectors).toHaveBeenCalledTimes(1);
+    expect(daemon.evaluateSelectors.mock.calls[0][0].map(selectorToProto)).toEqual([{ textContains: 'Sign in' }]);
+    expect(daemon.findElements).not.toHaveBeenCalled();
+  });
+
+  it('surfaces the agent rejecting the locator instead of reporting no match', async () => {
+    hoisted.client = makeDaemon({ evaluate: () => new Error('Invalid regex: look-behind is not supported') }).client;
+    const res = await callTool('tapsmith_test_locator', { locator: 'device.getByText(/(?<=a)b/)' });
+    expect(res.isError).toBe(true);
+    expect(text(res)).toBe('Error: Invalid regex: look-behind is not supported');
   });
 });
 
