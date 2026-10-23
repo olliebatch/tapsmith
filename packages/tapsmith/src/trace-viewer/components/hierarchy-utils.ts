@@ -219,3 +219,81 @@ export function isLabelField(node: HierarchyNode): boolean {
 export function webViewAriaLabel(node: HierarchyNode): string {
   return node.attributes.get('webview-aria-label') ?? node.attributes.get('content-desc') ?? '';
 }
+
+// ─── Geometry ───
+
+export function getNodeBounds(node: HierarchyNode): Bounds | null {
+  const boundsStr = node.attributes.get('bounds');
+  if (!boundsStr) return null;
+  return parseBounds(boundsStr);
+}
+
+// ─── Hit Testing ───
+
+function boundsContains(bounds: Bounds, x: number, y: number): boolean {
+  return x >= bounds.left && x <= bounds.right && y >= bounds.top && y <= bounds.bottom;
+}
+
+function boundsArea(bounds: Bounds): number {
+  return (bounds.right - bounds.left) * (bounds.bottom - bounds.top);
+}
+
+export function hitTest(roots: HierarchyNode[], x: number, y: number): HierarchyNode | null {
+  let best: HierarchyNode | null = null;
+  let bestArea = Infinity;
+  let bestIsWebView = false;
+
+  function walk(node: HierarchyNode) {
+    const bounds = getNodeBounds(node);
+    if (bounds && boundsContains(bounds, x, y)) {
+      const area = boundsArea(bounds);
+      const isWv = node.attributes.get('webview') === 'true';
+      // Prefer WebView DOM nodes over native nodes at similar coordinates —
+      // UIAutomator2/XCUITest also expose web content as native elements,
+      // but the WebView DOM nodes produce better selectors (CSS-based).
+      const shouldReplace = isWv && !bestIsWebView
+        ? area <= bestArea * 1.5   // WebView node wins unless much larger
+        : !isWv && bestIsWebView
+          ? false                   // Never replace a WebView node with native
+          : area <= bestArea;        // Same category: smallest wins (equal picks deeper node)
+      if (shouldReplace) {
+        best = node;
+        bestArea = area;
+        bestIsWebView = isWv;
+      }
+    }
+    for (const child of node.children) {
+      walk(child);
+    }
+  }
+
+  for (const root of roots) {
+    walk(root);
+  }
+  return best;
+}
+
+/** The node reached by `path` (child indices from the roots), if it exists. */
+export function nodeAtPath(roots: HierarchyNode[], path: number[]): HierarchyNode | undefined {
+  let nodes = roots;
+  let node: HierarchyNode | undefined;
+  for (const index of path) {
+    node = nodes[index];
+    if (!node) return undefined;
+    nodes = node.children;
+  }
+  return node;
+}
+
+/** Child indices from the roots to `target`, or undefined if it is not in the tree. */
+export function pathToNode(roots: HierarchyNode[], target: HierarchyNode): number[] | undefined {
+  const walk = (nodes: HierarchyNode[], prefix: number[]): number[] | undefined => {
+    for (let i = 0; i < nodes.length; i++) {
+      if (nodes[i] === target) return [...prefix, i];
+      const found = walk(nodes[i].children, [...prefix, i]);
+      if (found) return found;
+    }
+    return undefined;
+  };
+  return walk(roots, []);
+}

@@ -80,6 +80,8 @@ import { mergeResetCapabilities, nextCandidate as pickCandidate, policyForFile, 
 import type { AppResetPolicy, PreparedState, ResetCapabilities } from '../app-reset.js';
 import { DEFAULT_UI_PREFERENCES, type DeviceActivityMessage, type UIPreferences } from './ui-protocol.js';
 import { beginTestRun, endTestRun } from '../mcp/sdk-device.js';
+import { evaluateLiveLocator, LatestOnlyRunner, LiveHierarchyCache, suggestLiveLocators, type LiveLocatorEvaluation } from './live-locators.js';
+import { nodeAtPath, parseHierarchyXml } from '../trace-viewer/components/hierarchy-utils.js';
 import {
   forkStdioForLaunchProgress,
   pipeForkOutputForLaunchProgress,
@@ -2362,6 +2364,8 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
     child.on('exit', (code, signal) => {
       if (worker.retired || worker.dispatchAttached) return;
       worker.retired = true;
+      // Its id may be reused for another device: its captures must not resolve a pick.
+      liveHierarchies.forgetWorker(worker.id);
       worker.busy = false;
       worker.currentFile = undefined;
       worker.currentTest = undefined;
@@ -2774,6 +2778,8 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
       function retireWorker(worker: UIWorkerHandle, reason: string): void {
         if (worker.retired) return;
         worker.retired = true;
+      // Its id may be reused for another device: its captures must not resolve a pick.
+      liveHierarchies.forgetWorker(worker.id);
         const inFlightFile = worker.currentFile;
         const inFlightTest = worker.currentTest;
         const inFlightReported = worker.reportedInFile;
@@ -3228,6 +3234,8 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
       try { worker.process.kill('SIGKILL'); } catch { /* already dead */ }
 
       worker.retired = true;
+      // Its id may be reused for another device: its captures must not resolve a pick.
+      liveHierarchies.forgetWorker(worker.id);
       worker.busy = false;
       readinessEvent(worker, { type: 'worker-retired' });
       broadcastWorkerStatus(worker, 'error');
@@ -3423,6 +3431,8 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       worker.retired = true;
+      // Its id may be reused for another device: its captures must not resolve a pick.
+      liveHierarchies.forgetWorker(worker.id);
       broadcastWorkerStatus(worker, 'error');
       // Settle the activity row too, or it spins forever in Device Activity.
       pushActivity({ type: 'device-activity', id: activityId, workerId: worker.id, kind: 'recycle', status: 'error', label: 'Recycle worker (fresh code)', detail: errMsg, timestamp: startedAt, durationMs: Date.now() - startedAt });
@@ -3760,6 +3770,72 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
       describe(0, worker.deviceSerial, worker.displayName),
       ...worker.members.map((m, i) => describe(i + 1, m.deviceSerial, m.displayName)),
     ];
+  }
+
+  // ─── Live locators (PILOT-848) ───
+
+  /** Recent live hierarchy captures per device, so a pick can name the one it was made on. */
+  const liveHierarchies = new LiveHierarchyCache();
+  /** One live locator evaluation per device at a time; superseded ones never run. */
+  const liveEvaluations = new LatestOnlyRunner<LiveLocatorEvaluation>();
+  /** The latest pick per device and tab, by a generation count. */
+  const latestPicks = new Map<string, number>();
+  /**
+   * When a live WebView connect last failed per device (`worker:device`),
+   * off the adopted primary: re-asking every capture would otherwise spend
+   * the 15 s connect budget each time on a WebView that cannot be inspected.
+   */
+  const liveConnectFailedAt = new Map<string, number>();
+  const DEBUGGABLE_HINT = 'Make sure it is debuggable (webviewDebuggingEnabled={true}, or WebView.setWebContentsDebuggingEnabled(true) on Android).';
+  /** Notes a live answer's WebView connect failure, to hold off the next connects. */
+  function noteLiveConnect(workerId: number, deviceIndex: number, error: string | undefined): void {
+    if (error && /^(Timed out waiting for WebView|WebView connection setup timed out)/.test(error)) {
+      liveConnectFailedAt.set(`${workerId}:${deviceIndex}`, Date.now());
+    }
+  }
+
+  /** The device a live locator question is about, resolved as request-hierarchy resolves it. */
+  function liveLocatorTarget(workerId: number | undefined, deviceIndex: number | undefined):
+    {
+      workerId: number; deviceIndex: number; client: TapsmithGrpcClient; serial: string | undefined
+      webview: (() => Promise<import('../webview-handle.js').WebViewHandle>) | undefined
+      beforeConnect: () => void
+    } | undefined {
+    const id = workerId ?? selectedWorkerId;
+    const index = deviceIndex ?? (id === selectedWorkerId ? selectedDeviceIndex : 0);
+    const worker = uiWorkers.find((w) => w.id === id && !w.retired);
+    const client = worker ? deviceClientOf(worker, index) : undefined;
+    if (!worker || !client) return undefined;
+    const serial = index <= 0 ? worker.deviceSerial : worker.members[index - 1]?.deviceSerial;
+    // The primary device's WebView is the one the picker connects to: use
+    // that connection once it is up rather than open a second (PILOT-288).
+    // The live tab's hierarchy poll is what brings it up.
+    const device = worker.adoptedPrimary && index === 0 ? ctx.device : undefined;
+    // Any device: a webview.* locator connects only once a capture shows a
+    // WebView on screen. A connect that could only time out would hold the
+    // device's live answers for the connect budget. Before the first
+    // capture the screen is unknown: the re-ask that capture brings answers.
+    const beforeConnect = () => {
+      const xml = liveHierarchies.latest(id, index);
+      if (xml === undefined) throw new Error('Reading the screen…');
+      if (!xml.includes('XCUIElementTypeWebView') && !xml.includes('android.webkit.WebView')) {
+        throw new Error('No WebView on screen.');
+      }
+      if (!device && Date.now() - (liveConnectFailedAt.get(`${id}:${index}`) ?? 0) < WEBVIEW_INSPECT_FAILURE_COOLDOWN_MS) {
+        throw new Error(`Could not connect to the WebView; retrying. ${DEBUGGABLE_HINT}`);
+      }
+    };
+    const webview = device
+      ? async () => {
+        const handle = device._connectedWebView();
+        if (handle) return handle;
+        if (Date.now() - webviewInspectFailedAt < WEBVIEW_INSPECT_FAILURE_COOLDOWN_MS) {
+          throw new Error(`Could not connect to the WebView; retrying. ${DEBUGGABLE_HINT}`);
+        }
+        throw new Error('Connecting to the WebView; the count appears once the connection is up.');
+      }
+      : undefined;
+    return { workerId: id, deviceIndex: index, client, serial, webview, beforeConnect };
   }
 
   /** The gRPC client driving device `deviceIndex` of a worker's group (0 = primary). */
@@ -4514,15 +4590,66 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
           // webview.* locators. Primary-device only — the server's Device
           // instance can open a WebView connection to that device; other
           // workers' devices (and group members) have none.
-          const webviewDom = hierWorker?.adoptedPrimary && hierDeviceIndex === 0 ? await dumpWebViewDomForPicker(xml) : undefined;
+          const webviewOverlay = !!hierWorker?.adoptedPrimary && hierDeviceIndex === 0;
+          const webviewDom = webviewOverlay ? await dumpWebViewDomForPicker(xml) : undefined;
           if (webviewDom) {
             const lastClose = xml.lastIndexOf('</');
             if (lastClose !== -1) {
               xml = xml.slice(0, lastClose) + webviewDom + '\n' + xml.slice(lastClose);
             }
           }
-          broadcast({ type: 'hierarchy-update', xml, workerId: hierWorkerId, deviceIndex: hierDeviceIndex });
+          // Retired meanwhile: its id may already name another device.
+          if (hierWorker?.retired) return;
+          const revision = liveHierarchies.remember(hierWorkerId, hierDeviceIndex, xml);
+          broadcast({ type: 'hierarchy-update', xml, revision, workerId: hierWorkerId, deviceIndex: hierDeviceIndex, webviewOverlay });
         }).catch(() => {});
+        break;
+      }
+      case 'evaluate-locator': {
+        const target = liveLocatorTarget(msg.workerId, msg.deviceIndex);
+        const requestId = msg.requestId;
+        if (!target) {
+          broadcast({ type: 'locator-evaluation', requestId, bounds: [], error: 'No live device to check the locator on.' });
+          break;
+        }
+        liveEvaluations.run(
+          // Per tab: a tab's waiting request must never be dropped for another's.
+          `${target.workerId}:${target.deviceIndex}:${msg.clientId ?? ''}`,
+          () => evaluateLiveLocator(target.client, target.serial, msg.locator, { webview: target.webview, beforeConnect: target.beforeConnect }),
+          (result) => {
+            noteLiveConnect(target.workerId, target.deviceIndex, result.error);
+            broadcast({ type: 'locator-evaluation', requestId, ...result });
+          },
+        );
+        break;
+      }
+      case 'suggest-locators': {
+        const target = liveLocatorTarget(msg.workerId, msg.deviceIndex);
+        const requestId = msg.requestId;
+        const xml = target ? liveHierarchies.at(target.workerId, target.deviceIndex, msg.revision) : undefined;
+        const node = xml ? nodeAtPath(parseHierarchyXml(xml), msg.path) : undefined;
+        if (!target || !node) {
+          broadcast({
+            type: 'locator-suggestions', requestId, suggestions: [],
+            note: target ? 'The screen has changed since that pick; pick the element again.' : 'No live device to check locators on.',
+          });
+          break;
+        }
+        // A tab's newer pick on this device replaces this one: its check
+        // stops between candidates and its answer is never sent.
+        const pickKey = `${target.workerId}:${target.deviceIndex}:${msg.clientId ?? ''}`;
+        const generation = (latestPicks.get(pickKey) ?? 0) + 1;
+        latestPicks.set(pickKey, generation);
+        const superseded = () => latestPicks.get(pickKey) !== generation;
+        void suggestLiveLocators(target.client, target.serial, node, { ios: xml!.includes('<XCUIElementType'), webview: target.webview, beforeConnect: target.beforeConnect, superseded })
+          .then((result) => {
+            noteLiveConnect(target.workerId, target.deviceIndex, result.note);
+            if (!superseded()) broadcast({ type: 'locator-suggestions', requestId, ...result });
+          })
+          .catch((err) => broadcast({
+            type: 'locator-suggestions', requestId, suggestions: [],
+            note: err instanceof Error ? err.message : String(err),
+          }));
         break;
       }
       case 'request-source':
@@ -4609,6 +4736,8 @@ function wireStatus(status: TestResultEntry['status']): TestNodeStatus {
         const worker = uiWorkers.find((w) => w.id === msg.workerId);
         if (worker && !worker.retired) {
           worker.retired = true;
+      // Its id may be reused for another device: its captures must not resolve a pick.
+      liveHierarchies.forgetWorker(worker.id);
           worker.busy = false;
           try { if (worker.process.connected) worker.process.send({ type: 'shutdown' }); } catch { /* dead */ }
           console.log(`${DIM}Worker ${worker.id} marked for respawn by user${RESET}`);
