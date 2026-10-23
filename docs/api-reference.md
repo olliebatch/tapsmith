@@ -20,7 +20,7 @@ device.getByText(/^welcome to\sexpo$/i)              // RegExp
 
 Whitespace is normalized on both sides before comparing a string, exact or not, as in Playwright: runs of whitespace — including non-breaking spaces (`&nbsp;`, U+00A0), other Unicode spaces and line breaks — collapse to one space, and leading and trailing whitespace is ignored. So `getByText("Welcome to Expo", { exact: true })` matches text rendered as `Welcome to&nbsp;Expo` or split over two lines. The same applies to `getByRole`'s `name` and to `getByLabel`.
 
-Without `exact`, a string `getByText` also ignores case, as `getByRole`'s `name` does. Case is folded with Unicode case mappings that don't depend on the device's locale, so `getByText("login")` finds `LOGIN` on a Turkish device too. A few special characters (such as `ß`) may fold differently per platform. On iOS, while the software keyboard is up, its keys are elements too, so a substring such as `getByText("Delete")` can also match the keyboard's `delete` key; pass `{ exact: true }` or call `hideKeyboard()` first. `{ exact: true }`, `getByLabel`, `getByPlaceholder` and `getByDescription` are case-sensitive.
+Without `exact`, a string `getByText` also ignores case, as `getByRole`'s `name` does. Case is folded with Unicode case mappings that don't depend on the device's locale, so `getByText("login")` finds `LOGIN` on a Turkish device too. A few special characters (such as `ß`) may fold differently per platform. The software keyboard's keys never match, so `getByText("Delete")` does not find the keyboard's `delete` key ([what locators never match](locators.md#what-locators-never-match)). `{ exact: true }`, `getByLabel`, `getByPlaceholder` and `getByDescription` are case-sensitive.
 
 #### Regular expressions
 
@@ -184,6 +184,8 @@ try {
   throw err;
 }
 ```
+
+> **The keyboard, the system bars and the hooks marker never match.** The software keyboard, the iOS application element, Android's status and navigation bars and the `@tapsmith/react-native` hooks marker are never matched by a locator (Android XPath, which reads the raw dump, aside), so they never make one ambiguous. A notification shade, a permission dialog or another app's window does match. See [what locators never match](locators.md#what-locators-never-match).
 
 > **Accessibility-tree duplicates don't count.** Some platforms expose the same visual element twice — iOS in particular renders a React Native `<Text testID="...">` as a parent `StaticText` carrying the attributes plus an inner child with identical text and pixel-identical bounds. Matches with identical text **and** identical bounds are collapsed to one element (the attribute-carrying first occurrence) before the strict check, since acting on either taps the same point. This collapsing also applies to `count()`, `all()`, and `.nth()` indexing, so positional chains stay consistent with what you see on screen. Distinct elements that merely share text at different positions still violate.
 

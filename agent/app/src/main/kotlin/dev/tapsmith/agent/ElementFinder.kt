@@ -592,12 +592,13 @@ class ElementFinder(
                 null
             }
 
+        val excludedWindows = nonAppWindowIds()
         val candidates = enumerate(selector, parent)
         val enumeratedAt = SystemClock.uptimeMillis()
 
         var extractMs = 0L
         val (matches, examined) =
-            matchCandidates(candidates, selector, fresh, limit) { obj, node ->
+            matchCandidates(candidates, selector, fresh, limit, excludedWindows) { obj, node ->
                 val extractStart = SystemClock.uptimeMillis()
                 cacheAndConvert(obj, node, fresh).also { extractMs += SystemClock.uptimeMillis() - extractStart }
             }
@@ -617,12 +618,15 @@ class ElementFinder(
      * The match step of a find: every candidate the walk enumerated that the
      * selector's non-native parts and state filters accept, in tree order,
      * up to [limit]. Returns the matches and how many candidates were read.
+     * A candidate that isn't the app's — in one of [excludedWindows], or the
+     * hooks marker — never matches ([NonAppNodes]).
      */
     private inline fun matchCandidates(
         candidates: List<UiObject2>,
         selector: ElementSelector,
         fresh: Boolean,
         limit: Int,
+        excludedWindows: Set<Int>,
         refreshed: MutableMap<AccessibilityNodeInfo, AccessibilityNodeInfo>? = null,
         convert: (UiObject2, AccessibilityNodeInfo) -> ElementInfo,
     ): Pair<List<ElementInfo>, Int> {
@@ -635,6 +639,7 @@ class ElementFinder(
             CommandCancellation.checkpoint()
             examined++
             val node = snapshotOf(obj, fresh, refreshed)
+            if (node.windowId in excludedWindows || NonAppNodes.isHooksMarker(node.text, node.contentDescription)) continue
             if (!matchesSelector(node, selector, fresh) || !matchesStateFilters(node, selector)) continue
             matches.add(convert(obj, node))
         }
@@ -659,6 +664,8 @@ class ElementFinder(
     fun evaluateSelectors(selectors: List<Result<ElementSelector>>): List<Result<List<ElementInfo>>> {
         val startedAt = SystemClock.uptimeMillis()
         var fresh = clearAccessibilityCache()
+        // One window list for the batch, re-read with the tree on a retry.
+        var excludedWindows = nonAppWindowIds()
         val refreshed = HashMap<AccessibilityNodeInfo, AccessibilityNodeInfo>()
         val maxAttempts = STALE_RETRY_ATTEMPTS.coerceAtLeast(1)
         val results =
@@ -668,7 +675,7 @@ class ElementFinder(
                 var outcome: Result<List<ElementInfo>> = Result.failure(StaleObjectException())
                 for (attempt in 0 until maxAttempts) {
                     try {
-                        outcome = Result.success(evaluateOne(selector, fresh, refreshed))
+                        outcome = Result.success(evaluateOne(selector, fresh, refreshed, excludedWindows))
                         break
                     } catch (e: StaleObjectException) {
                         // Retry this selector against a re-read tree; the
@@ -677,6 +684,7 @@ class ElementFinder(
                         if (attempt < maxAttempts - 1) {
                             CommandCancellation.sleep(STALE_RETRY_DELAY_MS)
                             fresh = clearAccessibilityCache()
+                            excludedWindows = nonAppWindowIds()
                             refreshed.clear()
                         }
                     } catch (e: CommandCancelledException) {
@@ -700,13 +708,52 @@ class ElementFinder(
         selector: ElementSelector,
         fresh: Boolean,
         refreshed: MutableMap<AccessibilityNodeInfo, AccessibilityNodeInfo>,
+        excludedWindows: Set<Int>,
     ): List<ElementInfo> {
         if (selector.xpath != null) {
             return findByXPath(selector.xpath).map { it.copy(elementId = "") }
         }
-        return matchCandidates(enumerate(selector, null), selector, fresh, Int.MAX_VALUE, refreshed) { obj, node ->
+        return matchCandidates(enumerate(selector, null), selector, fresh, Int.MAX_VALUE, excludedWindows, refreshed) { obj, node ->
             toElementInfo(obj, node, "", fresh).first
         }.first
+    }
+
+    /**
+     * The ids of the windows no locator searches ([NonAppNodes.excludesWindow]):
+     * the input method, and System UI's status and navigation bars. Read once per find, from the
+     * window list the walk itself searches; empty (nothing excluded) if it
+     * can't be read.
+     */
+    private fun nonAppWindowIds(): Set<Int> =
+        try {
+            instrumentation.uiAutomation.windows
+                .filter { window ->
+                    val rect = Rect()
+                    window.getBoundsInScreen(rect)
+                    NonAppNodes.excludesWindow(
+                        window.type,
+                        window.isFocused,
+                        window.isActive,
+                        HierarchyAttributes.Box(rect.left, rect.top, rect.right, rect.bottom),
+                        device.displayWidth,
+                        device.displayHeight,
+                    ) { rootPackageOf(window) }
+                }
+                .mapTo(HashSet()) { it.id }
+        } catch (e: Exception) {
+            warnOnce("nonAppWindowIds", e)
+            emptySet()
+        }
+
+    /** The package of [window]'s root node, or null when it has none. An accessibility round-trip. */
+    @Suppress("DEPRECATION")
+    private fun rootPackageOf(window: android.view.accessibility.AccessibilityWindowInfo): CharSequence? {
+        val root = window.root ?: return null
+        return try {
+            root.packageName
+        } finally {
+            root.recycle()
+        }
     }
 
     /**
@@ -1313,6 +1360,8 @@ class ElementFinder(
                 child.text?.toString()?.takeIf { it.isNotEmpty() }
                     ?: child.contentDescription?.toString()?.takeIf { it.isNotEmpty() }
             },
+            // The hooks marker is no one's visible text ([NonAppNodes]).
+            skip = { child -> NonAppNodes.isHooksMarker(child.text, child.contentDescription) },
             maxDepth = MAX_DESCENDANT_TEXT_DEPTH,
         ).joinToString(" ")
 
