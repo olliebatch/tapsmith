@@ -1286,6 +1286,31 @@ export class ElementHandle {
   }
 
   /**
+   * @internal — The Selector this locator sends the agent as it is, or
+   * undefined when it carries anything a Selector cannot hold (a position,
+   * filter, and/or, or a parent scope). MCP snapshot suggestions are checked
+   * by sending such selectors in one batch (PILOT-848).
+   */
+  _plainSelector(): Selector | undefined {
+    const o = this._options;
+    const modified = o.nthIndex !== undefined || !!o.filters?.length || !!o.post?.length
+      || !!o.andHandle || !!o.orHandle || !!o.scopeParent;
+    return modified ? undefined : this._selector;
+  }
+
+  /**
+   * @internal — What this locator matches right now, without waiting for a
+   * match, read the way `count()` reads it (a stale snapshot is re-read) (MCP `tapsmith_test_locator`,
+   * PILOT-848). `total` is the matches before a positional index narrowed
+   * them (equal to `matches.length` without one); `positional` says whether
+   * one did — such a locator is exempt from strict mode.
+   */
+  async _currentMatches(): Promise<{ matches: ElementInfo[]; total: number; positional: boolean }> {
+    const { all, matches } = await this._readMatchSet();
+    return { matches, total: all.length, positional: this._options.nthIndex !== undefined };
+  }
+
+  /**
    * @internal — Apply this handle's positional index and every modifier
    * chained after it, in call order, to its resolved matches (see
    * {@link PostIndexStep}). Filters chained before the index are applied by
@@ -1594,6 +1619,11 @@ export class ElementHandle {
     } catch (err) {
       return ElementHandle._classifyTickError(err);
     }
+  }
+
+  /** @internal — This locator with another timeout (MCP actions, PILOT-848). */
+  _withTimeout(timeoutMs: number): ElementHandle {
+    return ElementHandle._cloneWithTimeout(this, timeoutMs);
   }
 
   /**
@@ -1963,13 +1993,21 @@ export class ElementHandle {
    * whole timeout; anything else propagates at once.
    */
   private async _readMatches(): Promise<ElementInfo[]> {
-    if (this._timeoutMs === 0) return this._select(await this._resolveAll());
+    return (await this._readMatchSet()).matches;
+  }
+
+  /** {@link _readMatches}, also returning the matches before the positional index. */
+  private async _readMatchSet(): Promise<{ all: ElementInfo[]; matches: ElementInfo[] }> {
+    const read = async (h: ElementHandle) => {
+      const all = await h._resolveAll();
+      return { all, matches: await h._select(all) };
+    };
+    if (this._timeoutMs === 0) return read(this);
     const deadline = Date.now() + this._timeoutMs;
     let faultDeadline: number | undefined;
     while (true) {
       try {
-        const tick = ElementHandle._cloneWithTimeout(this, tickBudget(deadline));
-        return await tick._select(await tick._resolveAll());
+        return await read(ElementHandle._cloneWithTimeout(this, tickBudget(deadline)));
       } catch (err) {
         if (Date.now() >= deadline) throw err;
         if (isStaleSnapshotError(err) || isTransientAgentError(err)) {
