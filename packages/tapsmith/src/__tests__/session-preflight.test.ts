@@ -195,6 +195,20 @@ describe('session-preflight', () => {
     expect(prepared).toMatchObject({ policy: { mode: 'clear', scope: 'file' }, source: 'startup launch' });
   });
 
+  it('startup launch on macOS relaunches without clearing and reports a `restart` prepared state', async () => {
+    const ctx = makeContext({ config: { package: 'dev.tapsmith.mactestapp', platform: 'macos' } });
+    vi.mocked(ctx.client.getUiHierarchy).mockResolvedValue(iosHierarchy);
+
+    const prepared = await launchConfiguredApp(ctx, 'startup launch', { hooksProbeMs: 0 });
+
+    expect(ctx.device.restartApp).toHaveBeenCalledWith('dev.tapsmith.mactestapp');
+    expect(ctx.device.clearAppData).not.toHaveBeenCalled();
+    expect(ctx.device.launchApp).not.toHaveBeenCalled();
+    expect(prepared).toMatchObject({ policy: { mode: 'restart', scope: 'file' }, source: 'startup launch' });
+    // No React Native reset hooks on a native Mac app: no notice about them.
+    expect(ctx.notices).toEqual([]);
+  });
+
   it('startup launch after a fresh install only launches (nothing to clear)', async () => {
     const ctx = makeContext();
 

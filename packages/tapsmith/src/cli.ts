@@ -19,6 +19,7 @@ import { runnerClaimsUnhandledRejection } from './unhandled-errors.js';
 import { telemetry, readSdkVersion, ensureSessionEnv } from './telemetry.js';
 import { createReporters, ReporterDispatcher, type FullResult } from './reporter.js';
 import { ensureSessionReady } from './session-preflight.js';
+import { macosTargetSerial } from './macos-host.js';
 import {
   assertMacosRunMode,
   closeDeviceSession,
@@ -1020,6 +1021,12 @@ async function ensureSequentialTargetDevice(
   // The first `use.devices` member's pin, or root `device` — not `config.device`
   // alone, which left a group pinning both members with its primary auto-picked.
   const pinned = primaryDevicePin(config);
+  // macOS (experimental) runs on this Mac: nothing to find, boot or launch.
+  if (config.platform === 'macos') {
+    const serial = macosTargetSerial(pinned);
+    claimDeviceOrThrow(serial, currentSession());
+    return { selectedSerial: serial, launched: [] };
+  }
   if (pinned) {
     // Claimed before anything touches it (the health check may restart adb,
     // network capture restarts adbd as root): a device another session drives

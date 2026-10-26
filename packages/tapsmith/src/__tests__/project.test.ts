@@ -132,6 +132,12 @@ describe('resolveProjects() with macOS', () => {
     },
   );
 
+  it.each(['clear', 'warm'] as const)('refuses appReset: %s, which macOS cannot do yet', (appReset) => {
+    expect(() => resolveProjects(makeConfig({ ...mac, appReset })))
+      .toThrow(`sets platform: 'macos' but appReset: '${appReset}'. macOS resets by relaunching the app`);
+    expect(() => resolveProjects(makeConfig({ ...mac, appReset: 'restart' }))).not.toThrow();
+  });
+
   it('refuses a run mixing macOS and mobile projects, before any per-project check', () => {
     expect(() => resolveProjects(makeConfig({
       apk: './app.apk',

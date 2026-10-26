@@ -338,6 +338,7 @@ export async function resolveAgentArtifacts(
     requireXctestrun?: boolean
   } = {},
 ): Promise<AgentArtifacts> {
+  if (config.platform === 'macos') return resolveMacosAgentArtifacts(config, onProgress);
   const agentApkPath = config.agentApk
     ? path.resolve(config.rootDir, config.agentApk)
     : findAgentApk();
@@ -389,6 +390,32 @@ export async function resolveAgentArtifacts(
   return { agentApkPath, agentTestApkPath, iosXctestrunPath, iosAppPath };
 }
 
+/**
+ * macOS (experimental): the agent built from this checkout's source, and the
+ * app's `.app`, which the agent launches. A missing app is refused here, before
+ * the agent build and start, rather than as an xcodebuild failure.
+ */
+async function resolveMacosAgentArtifacts(
+  config: TapsmithConfig,
+  onProgress?: (message: string) => void,
+): Promise<AgentArtifacts> {
+  const iosAppPath = path.resolve(config.rootDir, config.app ?? '');
+  if (!config.app || !fs.existsSync(path.join(iosAppPath, 'Contents', 'Info.plist'))) {
+    throw new Error(
+      `macOS app not found at ${iosAppPath}. Build it first: \`app\` must point at a built .app bundle.`,
+    );
+  }
+  const { ensureMacAgent, macosAgentCacheDir } = await import('./macos-agent-build.js');
+  const { resolveIosAgentDir } = await import('./build-ios-agent.js');
+  onProgress?.('resolving macOS agent');
+  const iosXctestrunPath = await ensureMacAgent({
+    agentDir: resolveIosAgentDir(),
+    cacheDir: macosAgentCacheDir(),
+    onProgress,
+  });
+  return { iosXctestrunPath, iosAppPath };
+}
+
 // ─── App install ───
 
 interface InstallOutcome {
@@ -428,6 +455,12 @@ async function installAppUnderTest(
   const progress = opts.onProgress ?? (() => {});
   const phase = opts.onPhase ?? (() => {});
 
+  if (config.platform === 'macos') {
+    // The agent launches the app from its .app: nothing is installed.
+    progress('app install skipped');
+    phase('install', 'skip', 'macOS runs the app from its .app');
+    return { freshInstall: false };
+  }
   if (config.platform !== 'ios') {
     if (!config.apk) {
       progress('app install skipped');
@@ -667,7 +700,8 @@ export async function openDeviceSession(
       },
     );
 
-    if (!opts.skipWakeUnlock) {
+    // This Mac is never woken or unlocked: it is the machine running the tests.
+    if (!opts.skipWakeUnlock && config.platform !== 'macos') {
       try {
         progress('waking and unlocking device');
         await device.wake();
@@ -726,8 +760,8 @@ export async function openDeviceSession(
     const freshInstall = install.freshInstall;
 
     progress('starting Tapsmith agent');
-    phase('agent', 'start', config.platform === 'ios'
-      ? `starting iOS agent (${artifacts.iosXctestrunPath ? path.basename(artifacts.iosXctestrunPath) : 'xctestrun not set'})`
+    phase('agent', 'start', config.platform === 'ios' || config.platform === 'macos'
+      ? `starting ${config.platform === 'ios' ? 'iOS' : 'macOS'} agent (${artifacts.iosXctestrunPath ? path.basename(artifacts.iosXctestrunPath) : 'xctestrun not set'})`
       : 'starting Android automation agent');
     const startAgent = (): Promise<void> => device.startAgent(
       config.package ?? '',

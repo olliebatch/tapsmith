@@ -511,11 +511,21 @@ export async function launchConfiguredApp(
     return prepared();
   }
 
+  if (ctx.config.platform === 'macos') {
+    // macOS (experimental) cannot clear app data yet: a relaunch is its
+    // reset, so the launch satisfies `restart`, not `clear`. There are no
+    // in-app reset hooks to probe for on a native Mac app.
+    await ctx.device.restartApp(ctx.config.package);
+    await ensureSessionReady(ctx, phase, readinessAttempts);
+    await waitForAppReady(ctx);
+    return { ...prepared(), policy: { mode: 'restart', scope: 'file' } };
+  }
+
   if (options.freshInstall) {
     // Fresh install: there's no state to clear. On Android,
     // explicitly launch the app (iOS auto-launches via the XCUITest agent
     // during startAgent), then go straight to ensuring the session is ready.
-    if (ctx.config.platform !== 'ios') {
+    if (!drivenByXcuitest(ctx.config.platform)) {
       await ctx.device.launchApp(ctx.config.package, launchOptions(ctx.config));
     }
     await ensureSessionReady(ctx, phase, readinessAttempts);
@@ -676,7 +686,7 @@ export async function executeAppReset(
   }
 
   await step('ensureSessionReady', () => ensureSessionReady(ctx, options.phase));
-  if (processRecreated || ctx.config.platform === 'ios') {
+  if (processRecreated || drivenByXcuitest(ctx.config.platform)) {
     // A relaunched process is "ready" only once the app has drawn something:
     // the session check above is satisfied by a bare Activity/splash window,
     // and a deep link or hooks probe fired into a still-booting React Native
@@ -887,7 +897,7 @@ async function verifySession(
     throw new Error('agent is not connected');
   }
 
-  if (ctx.config.platform === 'ios') {
+  if (drivenByXcuitest(ctx.config.platform)) {
     // On iOS, ensure the configured app is in the foreground. If a previous
     // test terminated, backgrounded, or otherwise displaced the app, relaunch
     // it cheaply via launchApp (no clearData) so the next test starts on a
@@ -960,12 +970,21 @@ async function verifySession(
 }
 
 /**
+ * iOS and macOS: the XCUITest agent launches and drives the app, so they share
+ * the iOS paths (no explicit launch after install, agent-reported app state,
+ * hierarchy-based readiness, no adb).
+ */
+function drivenByXcuitest(platform: TapsmithConfig['platform']): boolean {
+  return platform === 'ios' || platform === 'macos';
+}
+
+/**
  * Wait for a (re)launched app to have rendered its first content. Platform
  * dispatch: iOS polls for a non-empty hierarchy ({@link waitForIosAppReady});
  * Android polls for rendered content ({@link waitForAndroidAppReady}).
  */
 async function waitForAppReady(ctx: SessionPreflightContext): Promise<void> {
-  if (ctx.config.platform === 'ios') return waitForIosAppReady(ctx);
+  if (drivenByXcuitest(ctx.config.platform)) return waitForIosAppReady(ctx);
   return waitForAndroidAppReady(ctx);
 }
 
@@ -1401,7 +1420,7 @@ async function waitForDialogGone(ctx: SessionPreflightContext, title: string): P
 
 async function recoverSession(ctx: SessionPreflightContext): Promise<void> {
   // First try ADB-level dismissal — works even when the agent is dead (Android only)
-  if (ctx.deviceSerial && ctx.config.platform !== 'ios') {
+  if (ctx.deviceSerial && !drivenByXcuitest(ctx.config.platform)) {
     dismissSystemDialogsViaAdb(ctx.deviceSerial);
   }
 

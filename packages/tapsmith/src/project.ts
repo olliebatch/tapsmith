@@ -583,6 +583,12 @@ function validateMacosConfig(where: string, config: TapsmithConfig): void {
       throw new Error(`${where} sets platform: 'macos' but also \`${key}\`, which macOS does not use. Remove it.`);
     }
   }
+  if (config.appReset === 'clear' || config.appReset === 'warm') {
+    throw new Error(
+      `${where} sets platform: 'macos' but appReset: '${config.appReset}'. macOS resets by relaunching the app `
+      + `(it cannot clear app data or reset warm yet): use appReset: 'auto' or 'restart'.`,
+    );
+  }
   if (!config.app) {
     throw new Error(`${where} sets platform: 'macos' but no \`app\`. platform: 'macos' needs \`app\`: the path to the .app to test.`);
   }

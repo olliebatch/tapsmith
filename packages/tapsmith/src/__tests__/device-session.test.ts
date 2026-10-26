@@ -122,6 +122,11 @@ vi.mock('../ios-simulator-build.js', () => ({
   ensureSimulatorAgent: vi.fn(async () => '/derived/TapsmithAgent.xctestrun'),
 }));
 
+vi.mock('../macos-agent-build.js', () => ({
+  ensureMacAgent: vi.fn(async () => '/cache/macos-agent/abc/TapsmithMacAgentUITests_macosx.xctestrun'),
+  macosAgentCacheDir: vi.fn(() => '/cache/macos-agent'),
+}));
+
 vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),
   execFileSync: vi.fn((file: string, args?: readonly string[]) => {
@@ -194,6 +199,52 @@ beforeEach(() => {
   mocks.preflight.launchConfiguredApp.mockClear();
   mocks.preflight.probeResetCapabilities.mockClear();
   mocks.preflight.checkMissingResetHooks.mockClear();
+});
+
+describe('openDeviceSession on macOS', () => {
+  let macRoot: string;
+  beforeEach(() => {
+    macRoot = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'tapsmith-mac-session-')));
+    fs.mkdirSync(path.join(macRoot, 'My.app', 'Contents'), { recursive: true });
+    fs.writeFileSync(path.join(macRoot, 'My.app', 'Contents', 'Info.plist'), '<plist/>');
+  });
+  const macConfig = (): TapsmithConfig => makeConfig({
+    platform: 'macos', rootDir: macRoot, app: './My.app', package: 'com.example.mac', apk: undefined,
+  });
+
+  it('starts the agent with the built macOS agent and the .app, and never wakes or installs', async () => {
+    await openDeviceSession(
+      { name: 'device-1', serial: 'macos-host', daemonAddress: 'localhost:50052' },
+      macConfig(),
+      { claimSession: SESSION, runMode: 'test', label: 'Device' },
+    );
+
+    const device = mocks.devices[0];
+    expect(device.startAgent).toHaveBeenCalledWith(
+      'com.example.mac', undefined, undefined,
+      '/cache/macos-agent/abc/TapsmithMacAgentUITests_macosx.xctestrun', path.join(macRoot, 'My.app'), false,
+    );
+    expect(device.wake).not.toHaveBeenCalled();
+    expect(device.unlock).not.toHaveBeenCalled();
+    expect(device.installApk).not.toHaveBeenCalled();
+    expect(mocks.simInstalls).toBe(0);
+    // No adb or simctl: there is no device or simulator to drive.
+    expect(mocks.execs.filter(([file]) => file === 'adb' || file === 'xcrun')).toEqual([]);
+  });
+
+  it('refuses an app that is not built, before building or starting the agent', async () => {
+    const { ensureMacAgent } = await import('../macos-agent-build.js');
+    vi.mocked(ensureMacAgent).mockClear();
+    fs.rmSync(path.join(macRoot, 'My.app'), { recursive: true });
+
+    await expect(openDeviceSession(
+      { name: 'device-1', serial: 'macos-host', daemonAddress: 'localhost:50052' },
+      macConfig(),
+      { claimSession: SESSION, runMode: 'test', label: 'Device' },
+    )).rejects.toThrow(`macOS app not found at ${path.join(macRoot, 'My.app')}. Build it first`);
+    expect(ensureMacAgent).not.toHaveBeenCalled();
+    expect(mocks.devices[0].startAgent).not.toHaveBeenCalled();
+  });
 });
 
 describe('openDeviceSession', () => {
