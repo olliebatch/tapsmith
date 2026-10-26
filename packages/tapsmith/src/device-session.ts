@@ -15,7 +15,7 @@ import * as path from 'node:path';
 import { execFileSync, type ChildProcess, type StdioOptions } from 'node:child_process';
 import { TapsmithGrpcClient } from './grpc-client.js';
 import { Device } from './device.js';
-import { deviceGroupSize, type Platform, type TapsmithConfig } from './config.js';
+import { deviceGroupSize, isAndroid, type Platform, type TapsmithConfig } from './config.js';
 import type { RunMode } from './telemetry.js';
 import { isNetworkTracingEnabled, networkHostsForPac, networkPassthroughHosts } from './trace/types.js';
 import { installedApkMatches, isPackageInstalled, waitForPackageIndexed } from './emulator.js';
@@ -405,11 +405,10 @@ async function resolveMacosAgentArtifacts(
       `macOS app not found at ${iosAppPath}. Build it first: \`app\` must point at a built .app bundle.`,
     );
   }
-  const { ensureMacAgent, macosAgentCacheDir } = await import('./macos-agent-build.js');
-  const { resolveIosAgentDir } = await import('./build-ios-agent.js');
+  const { ensureMacAgent, findMacosAgentDir, macosAgentCacheDir } = await import('./macos-agent-build.js');
   onProgress?.('resolving macOS agent');
   const iosXctestrunPath = await ensureMacAgent({
-    agentDir: resolveIosAgentDir(),
+    agentDir: findMacosAgentDir(),
     cacheDir: macosAgentCacheDir(),
     onProgress,
   });
@@ -786,7 +785,7 @@ export async function openDeviceSession(
       let message = err instanceof Error ? err.message : String(err);
       // No agent on the device and no APKs to install it from: say why the
       // APKs are missing, with the project's own install command (PILOT-709).
-      if (config.platform !== 'ios') {
+      if (isAndroid(config.platform)) {
         message = await missingAndroidAgentError(message, artifacts, config.rootDir).catch(() => undefined) ?? message;
       }
       phase('agent', 'fail', message);
@@ -981,7 +980,7 @@ export async function closeDeviceSession(session: DeviceSession): Promise<void> 
 }
 
 function removeAgentForward(session: DeviceSession): void {
-  if (session.agentPort !== undefined && session.config.platform !== 'ios') {
+  if (session.agentPort !== undefined && isAndroid(session.config.platform)) {
     try {
       execFileSync('adb', ['-s', session.serial, 'forward', '--remove', `tcp:${session.agentPort}`], {
         timeout: 5_000,

@@ -334,7 +334,7 @@ the mobile-only options (`apk`, `avd`, `agentApk`, `agentTestApk`, `simulator`,
   awake: if another app keeps focus, the app under test can't come to the front
   and the run fails to start. Tests that set the clipboard replace yours.
 - **Screenshots show the whole screen**, so traces and failure screenshots
-  include any other windows that are open.
+  include any other windows that are open. Traces don't include device logs yet.
 - **Network capture isn't supported yet**, and a run with it on is refused at
   agent start. Every trace mode captures the network by default, so turn it off
   when you record traces: `trace: { mode: "retain-on-failure", network: false }`.

@@ -125,6 +125,7 @@ vi.mock('../ios-simulator-build.js', () => ({
 vi.mock('../macos-agent-build.js', () => ({
   ensureMacAgent: vi.fn(async () => '/cache/macos-agent/abc/TapsmithMacAgentUITests_macosx.xctestrun'),
   macosAgentCacheDir: vi.fn(() => '/cache/macos-agent'),
+  findMacosAgentDir: vi.fn(() => '/repo/ios-agent'),
 }));
 
 vi.mock('node:child_process', async (importOriginal) => ({
@@ -230,6 +231,34 @@ describe('openDeviceSession on macOS', () => {
     expect(mocks.simInstalls).toBe(0);
     // No adb or simctl: there is no device or simulator to drive.
     expect(mocks.execs.filter(([file]) => file === 'adb' || file === 'xcrun')).toEqual([]);
+  });
+
+  it('never gives a failed macOS agent start the Android "agent APKs missing" advice', async () => {
+    mocks.noAgentFor.add('macos-host');
+    try {
+      const err = await openDeviceSession(
+        { name: 'device-1', serial: 'macos-host', daemonAddress: 'localhost:50052' },
+        macConfig(),
+        { claimSession: SESSION, runMode: 'test', label: 'Device' },
+      ).then(() => undefined, (e: unknown) => e);
+      expect(err).toBeInstanceOf(Error);
+      expect((err as Error).message).not.toContain("Tapsmith's Android agent");
+    } finally {
+      mocks.noAgentFor.clear();
+    }
+  });
+
+  it('closes a macOS session without touching adb', async () => {
+    const session = await openDeviceSession(
+      { name: 'device-1', serial: 'macos-host', daemonAddress: 'localhost:50052' },
+      macConfig(),
+      { claimSession: SESSION, runMode: 'test', label: 'Device', agentPort: 18701 },
+    );
+    mocks.execs.length = 0;
+
+    await closeDeviceSession(session);
+
+    expect(mocks.execs.filter(([file]) => file === 'adb')).toEqual([]);
   });
 
   it('refuses an app that is not built, before building or starting the agent', async () => {

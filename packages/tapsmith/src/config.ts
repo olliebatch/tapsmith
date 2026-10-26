@@ -30,6 +30,14 @@ export const APP_RESET_SCOPES: readonly AppResetScope[] = ['auto', 'file', 'test
 export const DEFAULT_APP_RESET_COLD_EVERY = 10;
 /** `macos` is experimental: this Mac, sequential `tapsmith test` only. */
 export type Platform = 'android' | 'ios' | 'macos';
+/**
+ * Whether a config targets Android, which an unset `platform` always has.
+ * Say this rather than `platform !== 'ios'`: with macOS that no longer means
+ * Android, and a Mac would run adb work against a device adb doesn't know.
+ */
+export function isAndroid(platform: Platform | undefined): boolean {
+  return (platform ?? 'android') === 'android';
+}
 
 export type { TraceMode, TraceConfig, VideoMode, VideoConfig };
 

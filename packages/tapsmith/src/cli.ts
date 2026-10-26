@@ -10,7 +10,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { claimBanner, printsBanner, runCli, type CliHandlers, type TestCommandArgs } from './cli-program.js';
-import { loadConfig, configPathOf, normalizeGrep, resolveDeviceStrategy, resolveDeviceGroup, primaryDevicePin, deviceGroupSize, assignGroupMemberDevices, EXPLICIT_WORKERS, isExplicitWorkers, isTapsmithNotInstalledError, isConfigValidationError, configLoadFailureOf, type DeviceGroupEntry, type TapsmithConfig } from './config.js';
+import { loadConfig, configPathOf, normalizeGrep, resolveDeviceStrategy, resolveDeviceGroup, primaryDevicePin, deviceGroupSize, assignGroupMemberDevices, EXPLICIT_WORKERS, isExplicitWorkers, isTapsmithNotInstalledError, isConfigValidationError, configLoadFailureOf, isAndroid, type DeviceGroupEntry, type TapsmithConfig } from './config.js';
 import figlet from 'figlet';
 import { TapsmithGrpcClient } from './grpc-client.js';
 import { Device } from './device.js';
@@ -603,7 +603,7 @@ async function setupSequentialDeviceClaimed(
 
   // Pre-flight: verify device is responsive before doing anything slow (Android only).
   // Skip in CI — the workflow already verified boot_completed=1 and disabled animations.
-  if (cfg.platform !== 'ios' && !isCI) {
+  if (isAndroid(cfg.platform) && !isCI) {
     progress?.update('primary-device', { state: 'running', detail: `checking ${deviceSerial}` });
     await checkDeviceHealth(deviceSerial, progress);
   }
@@ -681,7 +681,7 @@ async function setupSequentialDeviceClaimed(
     const { notifyLegacySudoersIfPresent } = await import('./legacy-cleanup.js');
     notifyLegacySudoersIfPresent();
   }
-  if (cfg.platform !== 'ios' && traceConfig.mode !== 'off' && traceConfig.network) {
+  if (isAndroid(cfg.platform) && traceConfig.mode !== 'off' && traceConfig.network) {
     const restarted = ensureAdbRoot(deviceSerial);
     if (restarted) {
       if (progress) progress.note('Enabled adb root for network capture.');
@@ -888,7 +888,7 @@ async function openGroupMembersOnFreshDaemons(
   try {
     for (const [i, entry] of members.entries()) {
       const serial = provisioned.serials[i];
-      if (cfg.platform !== 'ios' && traceConfig.mode !== 'off' && traceConfig.network) {
+      if (isAndroid(cfg.platform) && traceConfig.mode !== 'off' && traceConfig.network) {
         // Same as the primary: capture needs adb root on Android.
         ensureAdbRoot(serial);
       }

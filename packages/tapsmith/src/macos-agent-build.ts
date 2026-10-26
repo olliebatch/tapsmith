@@ -20,6 +20,30 @@ const SOURCE_DIRS = ['TapsmithAgent', 'macos'];
 /** Xcode's per-user and Finder state, which never changes the build. */
 const IGNORED_NAMES = new Set(['xcuserdata', '.DS_Store']);
 
+/**
+ * The `ios-agent` directory holding the macOS agent project: the checkout the
+ * SDK runs from (`packages/tapsmith/{dist,src}` → `ios-agent`, from any
+ * working directory), else `ios-agent` in the working directory. The npm
+ * package does not include the macOS agent yet.
+ */
+export function findMacosAgentDir(
+  from: { moduleDir: string; cwd: string } = { moduleDir: import.meta.dirname, cwd: process.cwd() },
+): string {
+  const candidates = [
+    path.resolve(from.moduleDir, '..', '..', '..', 'ios-agent'),
+    path.resolve(from.cwd, 'ios-agent'),
+  ];
+  const found = candidates.find((dir) => fs.existsSync(path.join(dir, 'macos', 'TapsmithMacAgent.xcodeproj')));
+  if (!found) {
+    throw new Error(
+      `The macOS agent project was not found (looked in ${candidates.join(' and ')}). macOS testing builds `
+        + 'the agent from source, which needs a checkout of the Tapsmith repository: the npm package does '
+        + 'not include it yet.',
+    );
+  }
+  return found;
+}
+
 export function macosAgentCacheDir(): string {
   return path.join(os.homedir(), '.tapsmith', 'macos-agent');
 }

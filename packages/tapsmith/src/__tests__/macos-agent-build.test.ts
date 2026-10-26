@@ -15,7 +15,7 @@ vi.mock('../ios-simulator-build.js', () => ({
 }));
 
 const { runXcodebuild } = await import('../ios-simulator-build.js');
-const { ensureMacAgent } = await import('../macos-agent-build.js');
+const { ensureMacAgent, findMacosAgentDir } = await import('../macos-agent-build.js');
 const xcodebuild = vi.mocked(runXcodebuild);
 
 let root: string;
@@ -77,5 +77,15 @@ describe('ensureMacAgent()', () => {
 
     expect(xcodebuild).toHaveBeenCalledTimes(2);
     expect(path.dirname(rebuilt)).not.toBe(path.dirname(first));
+  });
+});
+
+describe('findMacosAgentDir()', () => {
+  it('finds the checkout the SDK runs from, whatever the working directory', () => {
+    // root/packages/tapsmith/dist is where the SDK runs from in a checkout.
+    const moduleDir = path.join(root, 'packages', 'tapsmith', 'dist');
+    fs.mkdirSync(moduleDir, { recursive: true });
+
+    expect(findMacosAgentDir({ moduleDir, cwd: path.join(root, 'e2e') })).toBe(path.join(root, 'ios-agent'));
   });
 });
