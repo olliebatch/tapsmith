@@ -29,6 +29,7 @@ use crate::screenshot;
 mod android_backend;
 mod device_backend;
 mod ios_backend;
+mod macos_backend;
 
 use device_backend::{DeviceBackend, PermissionChange};
 
@@ -457,7 +458,9 @@ impl TapsmithServiceImpl {
     fn embedded_root_defaults_for(platform: Option<Platform>) -> EmbeddedRootDefaults {
         match platform {
             Some(Platform::Android) => EmbeddedRootDefaults::Skip,
-            Some(Platform::Ios) | None => EmbeddedRootDefaults::Apply,
+            // macOS: network capture is not supported there yet, so take the
+            // conservative default.
+            Some(Platform::Ios) | Some(Platform::MacOs) | None => EmbeddedRootDefaults::Apply,
         }
     }
 
@@ -633,7 +636,9 @@ impl TapsmithServiceImpl {
             return false;
         }
 
-        let is_ios = desired.platform == Platform::Ios;
+        // The connection's `is_ios` means "reached on localhost, no adb
+        // forward": true for the host-local macOS agent as well.
+        let is_ios = desired.platform != Platform::Android;
         let host_port = {
             let agent = self.agent.read().await;
             agent.connected_host_port_for(&desired.serial, is_ios)
@@ -6369,6 +6374,11 @@ mod tests {
         // iOS compiles its gRPC roots into the app binary — keep tunneling.
         assert_eq!(
             TapsmithServiceImpl::embedded_root_defaults_for(Some(Platform::Ios)),
+            EmbeddedRootDefaults::Apply
+        );
+        // macOS has no network capture yet: the conservative default.
+        assert_eq!(
+            TapsmithServiceImpl::embedded_root_defaults_for(Some(Platform::MacOs)),
             EmbeddedRootDefaults::Apply
         );
         // No device selected: tunnel rather than risk breaking the app.
