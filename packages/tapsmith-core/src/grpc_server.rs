@@ -1590,6 +1590,28 @@ impl TapsmithServiceImpl {
         }
     }
 
+    /// macOS: quit the app under test on shutdown. The agent launched it, and
+    /// stopping the agent stops only its runner, so the app would otherwise
+    /// stay open after the run. Only that `.app`, by its path, is stopped.
+    pub async fn quit_macos_app_under_test(&self) {
+        let on_mac = matches!(
+            self.device_manager.read().await.active_device(),
+            Some(d) if d.platform == Platform::MacOs
+        );
+        if !on_mac {
+            return;
+        }
+        let app_path = self
+            .ios_agent_config
+            .read()
+            .await
+            .as_ref()
+            .and_then(|c| c.app_path.clone());
+        if let Some(app_path) = app_path {
+            crate::macos::agent_launch::stop_app(std::path::Path::new(&app_path)).await;
+        }
+    }
+
     /// Clean up WebView port forwards and proxy processes on shutdown.
     pub async fn cleanup_webview_state(&self) {
         // Clean up Android ADB port forwards

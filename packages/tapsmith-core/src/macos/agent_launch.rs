@@ -141,22 +141,29 @@ pub async fn start_agent(
 /// Stop any macOS agent runner and any running instance of the app at
 /// `app_path`. Nothing running is not an error.
 pub async fn stop_agent_and_app(app_path: &Path) {
-    for (label, pattern) in [
-        ("pkill macOS agent", kill_pattern().to_string()),
-        ("pkill macOS app", app_kill_pattern(app_path)),
-    ] {
-        if let Err(e) = bounded_output(
-            label,
-            Command::new("pkill").args(["-f", &pattern]),
-            KILL_TIMEOUT,
-        )
-        .await
-        {
-            debug!("{e:#}");
-        }
-    }
+    pkill("pkill macOS agent", kill_pattern()).await;
+    stop_app(app_path).await;
     // Give the processes a moment to exit and release the port.
     tokio::time::sleep(Duration::from_millis(1000)).await;
+}
+
+/// Stop any running instance of the app at `app_path`, and nothing else: the
+/// pattern names that bundle's executable by its full path. Not running is
+/// not an error.
+pub async fn stop_app(app_path: &Path) {
+    pkill("pkill macOS app", &app_kill_pattern(app_path)).await;
+}
+
+async fn pkill(label: &str, pattern: &str) {
+    if let Err(e) = bounded_output(
+        label,
+        Command::new("pkill").args(["-f", pattern]),
+        KILL_TIMEOUT,
+    )
+    .await
+    {
+        debug!("{e:#}");
+    }
 }
 
 /// Arguments for `xcodebuild` to run the patched agent on this Mac.
