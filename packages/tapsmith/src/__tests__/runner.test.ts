@@ -2014,6 +2014,7 @@ describe('resolvePlatformFixture()', () => {
   it('returns the explicit platform when set', () => {
     expect(resolvePlatformFixture(makeConfig({ platform: 'ios' }))).toBe('ios');
     expect(resolvePlatformFixture(makeConfig({ platform: 'android' }))).toBe('android');
+    expect(resolvePlatformFixture(makeConfig({ platform: 'macos' }))).toBe('macos');
   });
 
   it('defaults to android when no platform indicators are present', () => {

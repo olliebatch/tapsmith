@@ -15,7 +15,8 @@ import * as path from 'node:path';
 import { execFileSync, type ChildProcess, type StdioOptions } from 'node:child_process';
 import { TapsmithGrpcClient } from './grpc-client.js';
 import { Device } from './device.js';
-import { deviceGroupSize, type TapsmithConfig } from './config.js';
+import { deviceGroupSize, type Platform, type TapsmithConfig } from './config.js';
+import type { RunMode } from './telemetry.js';
 import { isNetworkTracingEnabled, networkHostsForPac, networkPassthroughHosts } from './trace/types.js';
 import { installedApkMatches, isPackageInstalled, waitForPackageIndexed } from './emulator.js';
 import { installApp, installAppAsync, installedAppMatches, isAppInstalled, probeSimulatorHealth, rebootSimulator } from './ios-simulator.js';
@@ -104,6 +105,25 @@ export interface DeviceSession {
 export type DeviceSessionPhase = 'install' | 'agent' | 'launch'
 export type DeviceSessionPhaseState = 'start' | 'complete' | 'skip' | 'fail'
 
+const MACOS_UNSUPPORTED_MODES: Record<Exclude<RunMode, 'test'>, string> = {
+  'test-parallel': 'parallel workers, --workers above 1,',
+  ui: 'UI mode, --ui,',
+  watch: 'watch mode, --watch,',
+  mcp: 'the MCP server',
+};
+
+/**
+ * macOS (experimental) runs through sequential `tapsmith test` only: every
+ * other embedder opens its session through here, so each refuses it.
+ */
+export function assertMacosRunMode(platform: Platform | undefined, runMode: RunMode): void {
+  if (platform !== 'macos' || runMode === 'test') return;
+  throw new Error(
+    `macOS testing currently supports sequential 'tapsmith test' only `
+    + `(${MACOS_UNSUPPORTED_MODES[runMode]} is not supported yet).`,
+  );
+}
+
 export interface OpenDeviceSessionOptions {
   /** Prefix for error messages and preflight labels, e.g. `Worker 0`. */
   label: string
@@ -114,6 +134,11 @@ export interface OpenDeviceSessionOptions {
    * Required so an embedder cannot open a device without claiming it.
    */
   claimSession: SessionIdentity
+  /**
+   * The embedder opening the session. Required so every run path states it:
+   * macOS is refused everywhere but sequential `tapsmith test`.
+   */
+  runMode: RunMode
   onProgress?: (message: string) => void
   /**
    * Step-level progress for embedders with a step UI (the sequential CLI):
@@ -552,6 +577,7 @@ export async function openDeviceSession(
   baseConfig: TapsmithConfig,
   opts: OpenDeviceSessionOptions,
 ): Promise<DeviceSession> {
+  assertMacosRunMode(baseConfig.platform, opts.runMode);
   const progress = opts.onProgress ?? (() => {});
   const phase = opts.onPhase ?? (() => {});
   const label = `${opts.label} (${spec.serial})`;
@@ -791,6 +817,7 @@ export async function openDeviceGroup(
   },
 ): Promise<DeviceSession[]> {
   if (specs.length === 0) return [];
+  assertMacosRunMode(config.platform, opts.runMode);
   // Claimed before anything slow (the artifact resolution below may build the
   // simulator agent): a device another session holds is refused up front.
   // Without a daemon address — each member's open records it once its daemon

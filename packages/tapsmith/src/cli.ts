@@ -20,6 +20,7 @@ import { telemetry, readSdkVersion, ensureSessionEnv } from './telemetry.js';
 import { createReporters, ReporterDispatcher, type FullResult } from './reporter.js';
 import { ensureSessionReady } from './session-preflight.js';
 import {
+  assertMacosRunMode,
   closeDeviceSession,
   sessionsForRun,
   consumePrepared,
@@ -709,6 +710,7 @@ async function setupSequentialDeviceClaimed(
       cfg,
       {
         claimSession: currentSession(),
+        runMode: 'test',
         label: 'Device',
         client,
         forceInstall,
@@ -916,6 +918,7 @@ async function openGroupMembersOnFreshDaemons(
 
     const sessions = await openDeviceGroup(specs, cfg, {
       claimSession: currentSession(),
+      runMode: 'test',
       label: 'Device',
       forceInstall,
       launchPhase: 'startup launch',
@@ -2248,7 +2251,23 @@ async function runTestCommand(args: TestCommandArgs): Promise<void> {
   // so reporters can correctly suppress file headings / show project tags
   // when buckets or per-project `workers:` push the actual concurrency above
   // the global `config.workers` value.
-  const { allocateBucketWorkers, bucketizeProjects, pinnedBucketSignatures, sharedDeviceGroup, targetSessionConfig, workerPlanNote, platformOfSerial, scopeDevicePinToPlatform, devicePinWorkersConflict, devicesPinnedByManyBuckets } = await import('./project.js');
+  const { allocateBucketWorkers, bucketizeProjects, pinnedBucketSignatures, sharedDeviceGroup, targetSessionConfig, workerPlanNote, platformOfSerial, scopeDevicePinToPlatform, devicePinWorkersConflict, devicesPinnedByManyBuckets, macosRunPlan } = await import('./project.js');
+  // macOS (experimental) runs through sequential `tapsmith test` only: refuse
+  // the other modes here, before any device or daemon is touched, and run
+  // one worker. (resolveProjects refuses a run mixing it with mobile projects.)
+  const runsMacos = projects.some((p) => p.effectiveConfig.platform === 'macos');
+  let macosWorkersNote: string | undefined;
+  if (runsMacos) {
+    const plan = macosRunPlan({ ui: !!args.ui, watch: !!args.watch, cliWorkers: args.workers, configWorkers: config.workers });
+    try {
+      assertMacosRunMode('macos', plan.runMode);
+    } catch (err) {
+      console.error(red((err as Error).message));
+      process.exit(1);
+    }
+    macosWorkersNote = plan.note;
+    config.workers = 1;
+  }
   // A root `device` (from `--device` or the config) reached every project,
   // the other platform's too, whose bucket then counted as pinned to a serial
   // it cannot drive. Keep it on the projects of the device's own platform.
@@ -2282,7 +2301,7 @@ async function runTestCommand(args: TestCommandArgs): Promise<void> {
     ));
     process.exit(1);
   }
-  const totalWorkers = sharedPins.length > 0 ? 1 : [...allocation.values()].reduce((s, n) => s + n, 0);
+  const totalWorkers = runsMacos || sharedPins.length > 0 ? 1 : [...allocation.values()].reduce((s, n) => s + n, 0);
   const maxFilesInAnyWave = Math.max(...projectWaves.map((wave) =>
     wave.reduce((sum, p) => sum + p.testFiles.length, 0),
   ));
@@ -2306,7 +2325,7 @@ async function runTestCommand(args: TestCommandArgs): Promise<void> {
   // with `--device` looks like parallelism silently stopped working.
   // The shared-pin note only when it changed something: a one-worker run
   // already runs its projects one after another.
-  const workerPlanWarning = sharedPins.length > 0
+  const workerPlanWarning = macosWorkersNote ?? (sharedPins.length > 0
     ? (config.workers > 1
       ? `running one worker: ${describeSharedPins} — a device pinned by several projects runs them one after another`
       : undefined)
@@ -2319,7 +2338,7 @@ async function runTestCommand(args: TestCommandArgs): Promise<void> {
     pins: [...new Set(runBuckets
       .filter((b) => (allocation.get(b.signature) ?? 0) > 0)
       .flatMap((b) => pinnedSignatures.get(b.signature)?.pins ?? []))],
-  });
+  }));
 
   // Reflect the effective parallelism on the config so reporters see the
   // real worker count. Downstream dispatcher paths pass `workers` explicitly,

@@ -28,7 +28,8 @@ export const APP_RESET_MODES: readonly AppResetMode[] = ['auto', 'clear', 'resta
 export const APP_RESET_SCOPES: readonly AppResetScope[] = ['auto', 'file', 'test'];
 /** Default for {@link TapsmithConfig.appResetColdEvery}. */
 export const DEFAULT_APP_RESET_COLD_EVERY = 10;
-export type Platform = 'android' | 'ios';
+/** `macos` is experimental: this Mac, sequential `tapsmith test` only. */
+export type Platform = 'android' | 'ios' | 'macos';
 
 export type { TraceMode, TraceConfig, VideoMode, VideoConfig };
 
@@ -1041,7 +1042,7 @@ function recordingOption(key: 'trace' | 'video', known: Readonly<Record<string, 
 }
 
 const ROOT_CHECKS: { readonly [K in keyof TapsmithConfig]-?: KeyCheck } = {
-  platform: oneOf(['android', 'ios']),
+  platform: oneOf(['android', 'ios', 'macos']),
   apk: optionalString,
   app: optionalString,
   activity: optionalString,

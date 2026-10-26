@@ -100,7 +100,7 @@ function hierarchy(...labels) {
 function buildArchive(mutate = () => {}) {
   const parts = {
     metadata: {
-      version: 2,
+      version: 3,
       tapsmithVersion: "0.5.0",
       testFile: TEST_FILE,
       testName: "API Calls screen > fetches and displays user",
