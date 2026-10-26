@@ -82,6 +82,9 @@ class ActionExecutor {
     /// The global screen point (x, y) as a coordinate. The application
     /// element has no usable frame on macOS (a coordinate from it is
     /// infinite), so anchor on the main window and offset to the point.
+    /// XCTest still logs "[DisplayManager] Could not find any displays
+    /// containing rect (inf, inf, 0.0, 0.0)" on every click and key event: its
+    /// own dispatch looks up the application snapshot's display. Harmless.
     private func windowCoordinate(x: Int, y: Int) -> XCUICoordinate {
         let window = app.windows.firstMatch
         let frame = window.frame
