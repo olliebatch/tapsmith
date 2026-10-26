@@ -212,7 +212,8 @@ pub struct TapsmithServiceImpl {
     /// stable for the daemon session (load_or_create), so once installed on
     /// a UDID it stays trusted.
     ios_ca_cert_installed: Arc<RwLock<std::collections::HashSet<String>>>,
-    /// iOS agent launch config (stored for restart on launchApp).
+    /// iOS agent launch config (stored for restart on launchApp). Also the
+    /// macOS agent's: the iOS-only paths reading it check `Platform::Ios`.
     ios_agent_config: Arc<RwLock<Option<IosAgentConfig>>>,
     /// Startup inputs for the currently connected agent. Used to make
     /// StartAgent idempotent when the daemon is already connected to the same

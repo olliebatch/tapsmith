@@ -1,19 +1,50 @@
 //! macOS device work: the host Mac, driven through the XCUITest agent built
 //! as a macOS UI-test bundle.
 //!
-//! Not wired up yet: every operation fails loudly with "not supported on
-//! macOS yet" (never a success for something that did not happen) until it
-//! is implemented. Methods that only read or clean up answer "unknown" or do
-//! nothing, since there is nothing to report or undo.
+//! The agent runs as `xcodebuild test-without-building` on this Mac and owns
+//! the app's lifecycle (it launches the app by path at start-up, then by
+//! bundle ID). Its start-up config lives in `ios_agent_config`, as on iOS.
+//!
+//! Everything not implemented yet fails loudly with "not supported on macOS
+//! yet" (never a success for something that did not happen). Methods that
+//! only clean up do nothing, since there is nothing to undo.
 
 use super::device_backend::{
     ActionResult, CaptureRoute, CaptureStop, DeviceBackend, PermissionChange,
 };
 use super::*;
+use crate::macos;
+use std::path::Path;
 
 pub(super) struct MacOsBackend<'a> {
-    #[allow(dead_code)] // Used once the agent launch lands.
     pub(super) svc: &'a TapsmithServiceImpl,
+}
+
+impl MacOsBackend<'_> {
+    async fn relaunch(
+        &self,
+        request_id: String,
+        serial: &str,
+        package_name: &str,
+        wait_for_idle: bool,
+        idle_timeout_ms: u64,
+    ) -> ActionResult {
+        let idle_timeout_ms = if idle_timeout_ms > 0 {
+            idle_timeout_ms
+        } else {
+            10_000
+        };
+        match self
+            .relaunch_app(serial, package_name, wait_for_idle, idle_timeout_ms)
+            .await
+        {
+            Ok(()) => Ok(TapsmithServiceImpl::success_action_response(request_id)),
+            Err(error_message) => Ok(self
+                .svc
+                .action_error(request_id, "LAUNCH_FAILED", error_message)
+                .await),
+        }
+    }
 }
 
 fn unsupported_message(operation: &str) -> String {
@@ -28,16 +59,42 @@ fn unsupported(operation: &str) -> Status {
 impl DeviceBackend for MacOsBackend<'_> {
     // ─── App ───
 
-    async fn terminate_app(&self, _request_id: String, _package: &str) -> ActionResult {
-        Err(unsupported("Terminating the app"))
+    async fn terminate_app(&self, request_id: String, package: &str) -> ActionResult {
+        let result = self
+            .svc
+            .send_agent_command_with_timeout(
+                &AgentCommand::TerminateApp {
+                    package: package.to_string(),
+                },
+                4_000,
+            )
+            .await;
+        self.svc.make_action_response(request_id, result).await
     }
 
-    async fn app_state(&self, _package: &str) -> Result<String, Status> {
-        Err(unsupported("Reading the app state"))
+    async fn app_state(&self, package: &str) -> Result<String, Status> {
+        let command = AgentCommand::GetAppState {
+            package: package.to_string(),
+        };
+        let result = self.svc.send_agent_command(&command).await?;
+        result
+            .data
+            .get("state")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| Status::internal("The macOS agent returned no app state"))
     }
 
+    // The app under test, as on iOS (the agent's `currentPackage` answers
+    // the same configured bundle ID).
     async fn current_package(&self) -> Result<String, Status> {
-        Err(unsupported("Reading the foreground app"))
+        self.svc
+            .ios_agent_config
+            .read()
+            .await
+            .as_ref()
+            .map(|c| c.target_package.clone())
+            .ok_or_else(|| Status::failed_precondition("The macOS agent has not been started"))
     }
 
     async fn current_activity(&self) -> Result<String, Status> {
@@ -56,12 +113,27 @@ impl DeviceBackend for MacOsBackend<'_> {
 
     // ─── Device state ───
 
-    async fn set_clipboard(&self, _request_id: String, _text: String) -> ActionResult {
-        Err(unsupported("Setting the clipboard"))
+    // The Mac's own pasteboard: a test that sets it replaces whatever the
+    // user had copied.
+    async fn set_clipboard(&self, request_id: String, text: String) -> ActionResult {
+        let result = self
+            .svc
+            .send_agent_command(&AgentCommand::SetClipboard { text })
+            .await;
+        self.svc.make_action_response(request_id, result).await
     }
 
     async fn get_clipboard(&self) -> Result<String, Status> {
-        Err(unsupported("Reading the clipboard"))
+        let result = self
+            .svc
+            .send_agent_command(&AgentCommand::GetClipboard {})
+            .await?;
+        result
+            .data
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| Status::internal("The macOS agent returned no clipboard text"))
     }
 
     async fn set_orientation(&self, _request_id: String, _orientation: &str) -> ActionResult {
@@ -108,18 +180,23 @@ impl DeviceBackend for MacOsBackend<'_> {
 
     // ─── App lifecycle ───
 
-    async fn app_is_running(&self, _package: &str) -> Option<bool> {
-        None // Unknown.
+    async fn app_is_running(&self, package: &str) -> Option<bool> {
+        let state = self.app_state(package).await.ok()?;
+        Some(state != "stopped")
     }
 
     async fn relaunch_app(
         &self,
         _serial: &str,
-        _package_name: &str,
-        _wait_for_idle: bool,
-        _idle_timeout_ms: u64,
+        package_name: &str,
+        wait_for_idle: bool,
+        idle_timeout_ms: u64,
     ) -> Result<(), String> {
-        Err(unsupported_message("Relaunching the app"))
+        // Agent terminateApp, then launchApp, then a readiness probe: no
+        // simctl involved, so the iOS path serves the Mac unchanged.
+        self.svc
+            .relaunch_ios_app_via_agent(package_name, wait_for_idle, idle_timeout_ms)
+            .await
     }
 
     async fn wipe_app_data(&self, _serial: &str, _package_name: &str) -> Result<(), String> {
@@ -140,20 +217,37 @@ impl DeviceBackend for MacOsBackend<'_> {
 
     async fn launch_app(
         &self,
-        _request_id: String,
-        _serial: String,
-        _req: &proto::LaunchAppRequest,
+        request_id: String,
+        serial: String,
+        req: &proto::LaunchAppRequest,
     ) -> ActionResult {
-        Err(unsupported("Launching the app"))
+        if req.clear_data {
+            return Err(unsupported("Clearing app data"));
+        }
+        self.relaunch(
+            request_id,
+            &serial,
+            &req.package_name,
+            req.wait_for_idle,
+            req.idle_timeout_ms,
+        )
+        .await
     }
 
     async fn restart_app(
         &self,
-        _request_id: String,
-        _serial: String,
-        _req: &proto::RestartAppRequest,
+        request_id: String,
+        serial: String,
+        req: &proto::RestartAppRequest,
     ) -> ActionResult {
-        Err(unsupported("Restarting the app"))
+        self.relaunch(
+            request_id,
+            &serial,
+            &req.package_name,
+            req.wait_for_idle,
+            req.idle_timeout_ms,
+        )
+        .await
     }
 
     async fn clear_app_data(
@@ -209,11 +303,46 @@ impl DeviceBackend for MacOsBackend<'_> {
 
     async fn take_screenshot(
         &self,
-        _request_id: String,
+        request_id: String,
     ) -> Result<Response<proto::ScreenshotResponse>, Status> {
-        Err(unsupported("Taking a screenshot"))
+        // Short timeout, as on iOS: screenshots are best-effort for tracing.
+        let failure = |error_message: String| proto::ScreenshotResponse {
+            request_id: request_id.clone(),
+            success: false,
+            data: Vec::new(),
+            error_message,
+        };
+        let resp = match self
+            .svc
+            .send_agent_command_with_timeout(&AgentCommand::Screenshot {}, 5000)
+            .await
+        {
+            Ok(resp) if resp.success => resp,
+            Ok(resp) => {
+                return Ok(Response::new(failure(
+                    resp.error
+                        .unwrap_or_else(|| "Screenshot failed".to_string()),
+                )))
+            }
+            Err(status) => return Ok(Response::new(failure(status.message().to_string()))),
+        };
+        let b64 = resp.data.get("data").and_then(|v| v.as_str()).unwrap_or("");
+        use base64::Engine;
+        Ok(Response::new(
+            match base64::engine::general_purpose::STANDARD.decode(b64) {
+                Ok(data) if !data.is_empty() => proto::ScreenshotResponse {
+                    request_id,
+                    success: true,
+                    data,
+                    error_message: String::new(),
+                },
+                Ok(_) => failure("The macOS agent returned an empty screenshot".to_string()),
+                Err(e) => failure(format!("Failed to decode screenshot data: {e}")),
+            },
+        ))
     }
 
+    // Tracing is refused at agent start (check_start_agent); nothing to arm.
     async fn prearm_network_tracing(&self, _req: &proto::SetDeviceRequest) {}
 
     // ─── Agent ───
@@ -221,15 +350,36 @@ impl DeviceBackend for MacOsBackend<'_> {
     fn check_start_agent(
         &self,
         request_id: &str,
-        _req: &proto::StartAgentRequest,
+        req: &proto::StartAgentRequest,
     ) -> Result<(), proto::ActionResponse> {
-        Err(proto::ActionResponse {
+        let refuse = |error_type: &str, error_message: String| proto::ActionResponse {
             request_id: request_id.to_string(),
             success: false,
-            error_type: "AGENT_START_FAILED".to_string(),
-            error_message: unsupported_message("Starting the agent"),
+            error_type: error_type.to_string(),
+            error_message,
             screenshot: Vec::new(),
-        })
+        };
+        if req.ios_xctestrun_path.is_empty() {
+            return Err(refuse(
+                "AGENT_NOT_CONFIGURED",
+                "macOS agent not configured: no .xctestrun for the macOS agent was given."
+                    .to_string(),
+            ));
+        }
+        if req.ios_app_path.is_empty() {
+            return Err(refuse(
+                "AGENT_NOT_CONFIGURED",
+                "macOS needs the app path: set the path to your .app in your Tapsmith config."
+                    .to_string(),
+            ));
+        }
+        if req.network_tracing_enabled {
+            return Err(refuse(
+                "AGENT_START_FAILED",
+                unsupported_message("Network tracing"),
+            ));
+        }
+        Ok(())
     }
 
     async fn reuse_agent(&self, _serial: &str, _req: &proto::StartAgentRequest) {}
@@ -238,27 +388,44 @@ impl DeviceBackend for MacOsBackend<'_> {
         &self,
         request_id: String,
         _serial: String,
-        _req: &proto::StartAgentRequest,
+        req: &proto::StartAgentRequest,
     ) -> Result<(), proto::ActionResponse> {
-        Err(proto::ActionResponse {
-            request_id,
-            success: false,
-            error_type: "AGENT_START_FAILED".to_string(),
-            error_message: unsupported_message("Starting the agent"),
-            screenshot: Vec::new(),
-        })
+        agent_comms::clear_stream_cache(&self.svc.agent_stream).await;
+        let agent_port = self.svc.agent.read().await.port();
+        if let Err(e) = macos::agent_launch::start_agent(
+            Path::new(&req.ios_xctestrun_path),
+            &req.target_package,
+            Path::new(&req.ios_app_path),
+            agent_port,
+        )
+        .await
+        {
+            error!(error = %e, "Failed to start the macOS agent");
+            return Err(proto::ActionResponse {
+                request_id,
+                success: false,
+                error_type: "AGENT_START_FAILED".to_string(),
+                error_message: format!("{e:#}"),
+                screenshot: Vec::new(),
+            });
+        }
+        *self.svc.ios_agent_config.write().await = Some(IosAgentConfig {
+            xctestrun_path: req.ios_xctestrun_path.clone(),
+            target_package: req.target_package.clone(),
+            app_path: Some(req.ios_app_path.clone()),
+        });
+        Ok(())
     }
 
-    async fn connect_agent(
-        &self,
-        _agent: &mut AgentConnection,
-        _serial: &str,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!(unsupported_message("Connecting to the agent"))
+    // Localhost with no adb forward, as on iOS.
+    async fn connect_agent(&self, agent: &mut AgentConnection, serial: &str) -> anyhow::Result<()> {
+        agent.connect_ios(serial).await
     }
 
     async fn after_agent_connected(&self, _serial: &str, _target_package: &str) {}
 
+    // start_agent already puts the Automation Mode and activation hints in
+    // its error, next to the xcodebuild output they were read from.
     async fn agent_start_diagnostics(&self, _serial: &str) -> String {
         String::new()
     }
