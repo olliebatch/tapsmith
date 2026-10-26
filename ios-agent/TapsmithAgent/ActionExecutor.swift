@@ -66,30 +66,40 @@ class ActionExecutor {
         #if os(macOS)
         // XCTest's private event-synthesis IPC is not available on macOS
         // (_XCT_synthesizeEvent:completion: is missing from the testmanagerd
-        // proxy), so click through the public mouse API. The application
-        // element has no usable frame on macOS (a coordinate from it is
-        // infinite), so anchor on the window and offset to the global point.
-        let window = app.windows.firstMatch
-        let frame = window.frame
-        window.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
-            .withOffset(CGVector(dx: CGFloat(x) - frame.minX, dy: CGFloat(y) - frame.minY))
-            .click()
-        return
-        #endif
+        // proxy), so click through the public mouse API.
+        windowCoordinate(x: x, y: y).click()
+        #else
         if !EventSynthesizer.tap(at: CGPoint(x: x, y: y)) {
             NSLog("[ActionExecutor] Event synthesis failed, falling back to XCUICoordinate.tap()")
             let normalized = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
             let point = normalized.withOffset(CGVector(dx: CGFloat(x), dy: CGFloat(y)))
             point.tap()
         }
+        #endif
     }
+
+    #if os(macOS)
+    /// The global screen point (x, y) as a coordinate. The application
+    /// element has no usable frame on macOS (a coordinate from it is
+    /// infinite), so anchor on the main window and offset to the point.
+    private func windowCoordinate(x: Int, y: Int) -> XCUICoordinate {
+        let window = app.windows.firstMatch
+        let frame = window.frame
+        return window.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
+            .withOffset(CGVector(dx: CGFloat(x) - frame.minX, dy: CGFloat(y) - frame.minY))
+    }
+    #endif
 
     /// Double-tap on an element's center point.
     func doubleTap(_ element: XCUIElement) throws {
         guard element.isHittable else {
             throw AgentError.actionFailed("Element is not hittable")
         }
+        #if os(macOS)
+        element.doubleClick()
+        #else
         element.doubleTap()
+        #endif
     }
 
     /// Double-tap at specific screen coordinates.
@@ -99,6 +109,11 @@ class ActionExecutor {
     /// unavailable, completing a partially-delivered gesture with exactly one
     /// more tap rather than re-tapping twice (which would deliver three).
     func doubleTapCoordinates(x: Int, y: Int, intervalMs: Int = 0) {
+        #if os(macOS)
+        // No event synthesis on macOS (see tapCoordinates): a public double
+        // click, at the system's double-click interval (`intervalMs` unused).
+        windowCoordinate(x: x, y: y).doubleClick()
+        #else
         let normalized = app.coordinate(withNormalizedOffset: CGVector(dx: 0, dy: 0))
         let point = normalized.withOffset(CGVector(dx: CGFloat(x), dy: CGFloat(y)))
         switch EventSynthesizer.doubleTap(at: CGPoint(x: x, y: y), intervalMs: intervalMs) {
@@ -111,6 +126,7 @@ class ActionExecutor {
             NSLog("[ActionExecutor] Double-tap synthesis failed, falling back to XCUICoordinate.doubleTap()")
             point.doubleTap()
         }
+        #endif
     }
 
     /// Long press on an element with configurable duration.
@@ -159,18 +175,23 @@ class ActionExecutor {
         guard !text.isEmpty else { return true }
         #if os(macOS)
         // _XCT_sendString is not available on macOS; type through the public
-        // API into whatever has keyboard focus.
+        // API into the element with keyboard focus (typing into the
+        // application element goes nowhere). Backspace is the Delete key there.
+        guard let focused = keyboardFocusedElement() else {
+            NSLog("[ActionExecutor] No element has keyboard focus; nothing to type into")
+            return false
+        }
+        let keys = text.replacingOccurrences(of: "\u{8}", with: XCUIKeyboardKey.delete.rawValue)
         if delayMs > 0 {
-            for char in text {
-                app.typeText(String(char))
+            for char in keys {
+                focused.typeText(String(char))
                 Thread.sleep(forTimeInterval: TimeInterval(delayMs) / 1000.0)
             }
         } else {
-            app.typeText(text)
+            focused.typeText(keys)
         }
         return true
-        #endif
-
+        #else
         if delayMs > 0 {
             let delay = TimeInterval(delayMs) / 1000.0
             var succeeded = true
@@ -184,7 +205,26 @@ class ActionExecutor {
         } else {
             return EventSynthesizer.typeText(text)
         }
+        #endif
     }
+
+    #if os(macOS)
+    /// The element that has keyboard focus, if any. `hasKeyboardFocus` is the
+    /// macOS focus attribute (iOS's `hasFocus` does not exist there).
+    private func keyboardFocusedElement() -> XCUIElement? {
+        let focused = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasKeyboardFocus == true"))
+            .firstMatch
+        return focused.exists ? focused : nil
+    }
+
+    /// Cmd+A into the focused element. False when nothing has keyboard focus.
+    func selectAllInFocusedElement() -> Bool {
+        guard let focused = keyboardFocusedElement() else { return false }
+        focused.typeKey("a", modifierFlags: .command)
+        return true
+    }
+    #endif
 
     /// Clear text in an element by selecting all and deleting.
     func clearText(_ element: XCUIElement) throws {

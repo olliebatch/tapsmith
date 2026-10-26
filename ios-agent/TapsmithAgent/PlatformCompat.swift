@@ -17,6 +17,18 @@ enum PlatformCompat {
         AgentError.actionFailed("\(what) is not supported on macOS")
     }
 
+    /// The app that draws system dialogs over the app under test: SpringBoard
+    /// on iOS. nil on macOS, which has no SpringBoard (querying it throws
+    /// "The app representing com.apple.springboard could not be found"), so
+    /// callers take their "no system dialog present" branch.
+    static func systemUIApp() -> XCUIApplication? {
+        #if os(macOS)
+        return nil
+        #else
+        return XCUIApplication(bundleIdentifier: "com.apple.springboard")
+        #endif
+    }
+
     static func screenshotCGImage(_ screenshot: XCUIScreenshot) -> CGImage? {
         #if os(macOS)
         return screenshot.image.cgImage(forProposedRect: nil, context: nil, hints: nil)
