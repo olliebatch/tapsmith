@@ -30,9 +30,10 @@ The first run builds the macOS agent and caches it in `~/.tapsmith/macos-agent/`
 
 ## What it covers, and what it doesn't
 
-The suite taps, types, toggles, checks that each test starts from the app's initial state, and
-checks that an absent element times out cleanly.
+The suite taps, types, toggles and saves, checks that each test starts from the app's initial state
+with its saved data cleared, and checks that an absent element times out cleanly.
 
-macOS is sequential `tapsmith test` only. Resets relaunch the app; they can't clear app data
-yet, so a test app that persisted data would carry it between tests. Network capture, permissions,
-swipe gestures, UI mode, watch mode, parallel workers and the MCP server aren't supported yet.
+macOS is sequential `tapsmith test` only. The test app is sandboxed, like most Mac apps: its data is
+cleared between tests, and backed up before the run and restored after it. Network capture,
+permissions, swipe gestures, UI mode, watch mode, parallel workers and the MCP server aren't
+supported yet.

@@ -583,10 +583,10 @@ function validateMacosConfig(where: string, config: TapsmithConfig): void {
       throw new Error(`${where} sets platform: 'macos' but also \`${key}\`, which macOS does not use. Remove it.`);
     }
   }
-  if (config.appReset === 'clear' || config.appReset === 'warm') {
+  if (config.appReset === 'warm') {
     throw new Error(
-      `${where} sets platform: 'macos' but appReset: '${config.appReset}'. macOS resets by relaunching the app `
-      + `(it cannot clear app data or reset warm yet): use appReset: 'auto' or 'restart'.`,
+      `${where} sets platform: 'macos' but appReset: 'warm'. macOS has no warm reset (it needs in-app `
+      + `hooks, which are React Native only): use appReset: 'auto', 'clear' or 'restart'.`,
     );
   }
   if (!config.app) {

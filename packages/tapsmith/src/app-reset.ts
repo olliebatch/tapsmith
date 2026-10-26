@@ -96,10 +96,11 @@ export function resolveAppResetPolicy(
   const warmAvailable = !!caps.hooksDetected || !!config.resetAppDeepLink;
 
   const requestedMode = config.appReset ?? 'auto';
-  // macOS (experimental) can neither clear app data nor reset warm yet: it
-  // relaunches. An explicit clear or warm is refused at config load.
+  // macOS (experimental) has no warm reset: it always clears (the daemon
+  // backs the app's data up for the run and restores it afterwards). An
+  // explicit warm is refused at config load.
   const autoMode: ResolvedAppResetMode = config.platform === 'macos'
-    ? 'restart'
+    ? 'clear'
     : (warmAvailable ? 'warm' : 'clear');
   const mode: ResolvedAppResetMode = requestedMode === 'auto' ? autoMode : requestedMode;
 

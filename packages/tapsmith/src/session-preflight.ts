@@ -512,13 +512,13 @@ export async function launchConfiguredApp(
   }
 
   if (ctx.config.platform === 'macos') {
-    // macOS (experimental) cannot clear app data yet: a relaunch is its
-    // reset, so the launch satisfies `restart`, not `clear`. There are no
-    // in-app reset hooks to probe for on a native Mac app.
-    await ctx.device.restartApp(ctx.config.package);
+    // macOS (experimental): clear (the daemon restores the app's data after
+    // the run) and relaunch. There are no in-app reset hooks to probe for on
+    // a native Mac app.
+    await hardClearAndLaunch(ctx);
     await ensureSessionReady(ctx, phase, readinessAttempts);
     await waitForAppReady(ctx);
-    return { ...prepared(), policy: { mode: 'restart', scope: 'file' } };
+    return prepared();
   }
 
   if (options.freshInstall) {
@@ -720,8 +720,8 @@ const runDirect: StepRunner = (_name, fn) => fn();
 async function hardClearAndLaunch(ctx: SessionPreflightContext, step: StepRunner = runDirect): Promise<void> {
   const pkg = ctx.config.package!;
 
-  if (ctx.config.platform === 'ios') {
-    // On iOS, clear data then restart for isolation.
+  if (drivenByXcuitest(ctx.config.platform)) {
+    // On iOS (and macOS), clear data then restart for isolation.
     // clearAppData removes AsyncStorage (including React Navigation state).
     // restartApp handles terminate → relaunch atomically through the daemon
     // with fallback mechanisms (in-runner relaunch → simctl relaunch →

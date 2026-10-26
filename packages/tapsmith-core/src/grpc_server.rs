@@ -1590,10 +1590,13 @@ impl TapsmithServiceImpl {
         }
     }
 
-    /// macOS: quit the app under test on shutdown. The agent launched it, and
-    /// stopping the agent stops only its runner, so the app would otherwise
-    /// stay open after the run. Only that `.app`, by its path, is stopped.
-    pub async fn quit_macos_app_under_test(&self) {
+    /// macOS, on shutdown: quit the app under test, then restore the data
+    /// this run backed up. The agent launched the app, and stopping the agent
+    /// stops only its runner, so the app would otherwise stay open after the
+    /// run. Only that `.app`, by its path, is stopped. A backup is never
+    /// restored under a running app: if the app cannot be named, the next
+    /// macOS run restores it instead.
+    pub async fn end_macos_run(&self) {
         let on_mac = matches!(
             self.device_manager.read().await.active_device(),
             Some(d) if d.platform == Platform::MacOs
@@ -1607,8 +1610,20 @@ impl TapsmithServiceImpl {
             .await
             .as_ref()
             .and_then(|c| c.app_path.clone());
-        if let Some(app_path) = app_path {
-            crate::macos::agent_launch::stop_app(std::path::Path::new(&app_path)).await;
+        let Some(app_path) = app_path else {
+            return;
+        };
+        crate::macos::agent_launch::stop_app(std::path::Path::new(&app_path)).await;
+        match crate::macos::app_data::finish_run().await {
+            Ok(restored) => {
+                for id in restored {
+                    info!("Restored {id}'s data as it was before the run");
+                }
+            }
+            Err(e) => warn!(
+                "Could not restore the app data backed up for this run ({e:#}); the next macOS \
+                 run restores it"
+            ),
         }
     }
 

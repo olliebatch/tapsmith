@@ -21,6 +21,39 @@ pub(super) struct MacOsBackend<'a> {
 }
 
 impl MacOsBackend<'_> {
+    /// Stop the app, then clear its data: a running app can write its state
+    /// back afterwards. The agent's terminate verifies the process is gone.
+    async fn clear_data(&self, package: &str) -> Result<(), String> {
+        let stopped = self
+            .svc
+            .send_agent_command_with_timeout(
+                &AgentCommand::TerminateApp {
+                    package: package.to_string(),
+                },
+                4_000,
+            )
+            .await;
+        match stopped {
+            Ok(resp) if resp.success => {}
+            Ok(resp) => {
+                return Err(format!(
+                    "Could not stop {package} before clearing its data: {}",
+                    resp.error
+                        .unwrap_or_else(|| "the agent reported a failure".to_string())
+                ))
+            }
+            Err(status) => {
+                return Err(format!(
+                    "Could not stop {package} before clearing its data: {}",
+                    status.message()
+                ))
+            }
+        }
+        macos::app_data::clear_backed_up(package)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+
     async fn relaunch(
         &self,
         request_id: String,
@@ -199,8 +232,8 @@ impl DeviceBackend for MacOsBackend<'_> {
             .await
     }
 
-    async fn wipe_app_data(&self, _serial: &str, _package_name: &str) -> Result<(), String> {
-        Err(unsupported_message("Clearing app data"))
+    async fn wipe_app_data(&self, _serial: &str, package_name: &str) -> Result<(), String> {
+        self.clear_data(package_name).await
     }
 
     async fn deliver_deep_link(
@@ -222,7 +255,12 @@ impl DeviceBackend for MacOsBackend<'_> {
         req: &proto::LaunchAppRequest,
     ) -> ActionResult {
         if req.clear_data {
-            return Err(unsupported("Clearing app data"));
+            if let Err(message) = self.clear_data(&req.package_name).await {
+                return Ok(self
+                    .svc
+                    .action_error(request_id, "LAUNCH_FAILED", message)
+                    .await);
+            }
         }
         self.relaunch(
             request_id,
@@ -252,10 +290,16 @@ impl DeviceBackend for MacOsBackend<'_> {
 
     async fn clear_app_data(
         &self,
-        _request_id: String,
-        _req: &proto::ClearAppDataRequest,
+        request_id: String,
+        req: &proto::ClearAppDataRequest,
     ) -> ActionResult {
-        Err(unsupported("Clearing app data"))
+        match self.clear_data(&req.package_name).await {
+            Ok(()) => Ok(TapsmithServiceImpl::success_action_response(request_id)),
+            Err(message) => Ok(self
+                .svc
+                .action_error(request_id, "ACTION_FAILED", message)
+                .await),
+        }
     }
 
     async fn supports_cold_deep_link(&self) -> bool {
@@ -391,6 +435,30 @@ impl DeviceBackend for MacOsBackend<'_> {
         req: &proto::StartAgentRequest,
     ) -> Result<(), proto::ActionResponse> {
         agent_comms::clear_stream_cache(&self.svc.agent_stream).await;
+        // Back the app's data up before the agent launches it (the launch
+        // writes data), with no instance running: a clear is only ever made
+        // on data that will be restored when the run ends.
+        macos::agent_launch::stop_app(Path::new(&req.ios_app_path)).await;
+        match macos::app_data::prepare_run(&req.target_package).await {
+            Ok(restored) => {
+                for id in restored {
+                    warn!("Restored {id}'s data, left cleared by a run that did not finish");
+                }
+            }
+            Err(e) => {
+                return Err(proto::ActionResponse {
+                    request_id,
+                    success: false,
+                    error_type: "AGENT_START_FAILED".to_string(),
+                    error_message: format!(
+                        "Could not back up {}'s data, so the run did not start (it would be cleared \
+                         between tests): {e:#}",
+                        req.target_package
+                    ),
+                    screenshot: Vec::new(),
+                });
+            }
+        }
         let agent_port = self.svc.agent.read().await.port();
         if let Err(e) = macos::agent_launch::start_agent(
             Path::new(&req.ios_xctestrun_path),

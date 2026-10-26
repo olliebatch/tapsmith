@@ -13,6 +13,8 @@ struct ContentView: View {
     @State private var count = 0
     @State private var name = ""
     @State private var agreed = false
+    // Persisted (UserDefaults): survives a relaunch, gone after a data clear.
+    @AppStorage("savedCount") private var savedCount = 0
 
     var body: some View {
         VStack(spacing: 12) {
@@ -29,6 +31,10 @@ struct ContentView: View {
                 .accessibilityIdentifier("agreeToggle")
             Text(agreed ? "Agreed" : "Not agreed")
                 .accessibilityIdentifier("agreeState")
+            Text("Saved: \(savedCount)")
+                .accessibilityIdentifier("savedCountLabel")
+            Button("Save count") { savedCount = count }
+                .accessibilityIdentifier("saveButton")
         }
         .padding(30)
     }

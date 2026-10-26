@@ -3,8 +3,8 @@ import { defineConfig } from "tapsmith"
 // ─── macOS (experimental) ───
 //
 // Runs e2e/macos against the SwiftUI app in test-app-macos, on this Mac.
-// macOS runs through sequential `tapsmith test` only, and resets by
-// relaunching the app (it cannot clear app data yet).
+// macOS runs through sequential `tapsmith test` only. The app's data is
+// cleared between tests, and restored to what it was once the run ends.
 //
 // Usage (from e2e/):
 //   ../test-app-macos/build.sh

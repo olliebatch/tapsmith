@@ -333,6 +333,14 @@ the mobile-only options (`apk`, `avd`, `agentApk`, `agentTestApk`, `simulator`,
 - **The tests drive this Mac.** Leave it alone while they run, unlocked and
   awake: if another app keeps focus, the app under test can't come to the front
   and the run fails to start. Tests that set the clipboard replace yours.
+- **App data is cleared between files, and yours is put back afterwards.**
+  `appReset` clears the app's data as it does on other platforms (`'warm'` is
+  refused: it needs React Native hooks). Before the run, Tapsmith backs up the
+  app's data (its sandbox container, or its preferences and the folders named
+  after its bundle ID), and restores it when the run ends, so your own data for
+  that app is unchanged. A run that is killed leaves its backup, and the next
+  macOS run restores it before it starts. Keychain items, App Group containers
+  and data stored elsewhere are neither cleared nor backed up.
 - **Screenshots show the whole screen**, so traces and failure screenshots
   include any other windows that are open. Traces don't include device logs yet.
 - **Network capture isn't supported yet**, and a run with it on is refused at

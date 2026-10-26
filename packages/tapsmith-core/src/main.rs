@@ -301,7 +301,7 @@ async fn main() -> Result<()> {
     let cleanup = async {
         service_handle.cleanup_network_proxy().await;
         service_handle.cleanup_webview_state().await;
-        service_handle.quit_macos_app_under_test().await;
+        service_handle.end_macos_run().await;
     };
     let _ = tokio::join!(agent_teardown, cleanup);
 

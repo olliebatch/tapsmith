@@ -132,10 +132,12 @@ describe('resolveProjects() with macOS', () => {
     },
   );
 
-  it.each(['clear', 'warm'] as const)('refuses appReset: %s, which macOS cannot do yet', (appReset) => {
-    expect(() => resolveProjects(makeConfig({ ...mac, appReset })))
-      .toThrow(`sets platform: 'macos' but appReset: '${appReset}'. macOS resets by relaunching the app`);
-    expect(() => resolveProjects(makeConfig({ ...mac, appReset: 'restart' }))).not.toThrow();
+  it('refuses appReset: warm, which macOS has no way to do', () => {
+    expect(() => resolveProjects(makeConfig({ ...mac, appReset: 'warm' })))
+      .toThrow("sets platform: 'macos' but appReset: 'warm'. macOS has no warm reset");
+    for (const appReset of ['clear', 'restart', 'auto'] as const) {
+      expect(() => resolveProjects(makeConfig({ ...mac, appReset }))).not.toThrow();
+    }
   });
 
   it('refuses a run mixing macOS and mobile projects, before any per-project check', () => {
